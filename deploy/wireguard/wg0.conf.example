@@ -1,0 +1,96 @@
+# WireGuard client configuration template for 192.168.1.164 (Debian 13 Proxmox LXC)
+#
+# Usage:
+#   1. Copy to /etc/wireguard/wg0.conf with strict permissions:
+#        cp /etc/wireguard/wg0.conf.example /etc/wireguard/wg0.conf
+#        chmod 0600 /etc/wireguard/wg0.conf
+#   2. Replace all <...> placeholders with real values.
+#   3. Do NOT commit real private keys or wg0.conf to git.
+
+[Interface]
+PrivateKey = <CLIENT_PRIVATE_KEY>
+
+# Assigned IPv4 tunnel address from your WireGuard server/provider (e.g. 10.66.66.2/32):
+Address = <CLIENT_VPN_IP/32>
+# If enabling IPv6 later (see AllowedIPs note below), add your IPv6 tunnel address:
+# Address = <CLIENT_VPN_IP/32>, <CLIENT_VPN_IPV6/128>
+
+# DNS handling:
+# 192.168.1.164 uses LAN DNS 192.168.1.1 in /etc/resolv.conf by default.
+# openresolv / resolvconf is NOT installed by default on 192.168.1.164; uncommenting
+# DNS below without installing it causes wg-quick to fail with:
+#   "resolvconf: command not found"
+# To route DNS through the VPN instead, first install openresolv:
+#   apt-get install -y --no-install-recommends openresolv
+# and then uncomment DNS below:
+# DNS = <VPN_DNS_IP>
+
+# Optional MTU (uncomment/tune if behind PPPoE or nested encapsulation):
+# MTU = 1420
+
+# --- Mandatory LAN & SSH route preservation (eth0: 192.168.1.164/24, gw: 192.168.1.1) ---
+# Note: 192.168.1.0/24 dev eth0 is an on-link kernel route already present in table 'main'.
+# NEVER run "ip route add 192.168.1.0/24 ..." (fails with "File exists") and NEVER run
+# "ip route del 192.168.1.0/24" in PreDown (breaks LAN & SSH connectivity).
+# 1) Verify the kernel LAN link route on eth0 exists before bringing up wg0:
+PreUp = ip -4 route show 192.168.1.0/24 dev eth0 | grep -q "192.168.1.0/24"
+# 2) Idempotently pin 192.168.1.0/24 to table 'main' at priority 100 (above wg-quick rules):
+PostUp = ip -4 rule show priority 100 | grep -q "to 192.168.1.0/24 lookup main" || ip -4 rule add to 192.168.1.0/24 lookup main priority 100
+# 3) Remove only the priority-100 policy rule on down (leave main LAN & default routes intact):
+PreDown = ip -4 rule del to 192.168.1.0/24 lookup main priority 100 2>/dev/null || true
+
+# Optional: additional private subnets routed behind gateway 192.168.1.1 (never 192.168.1.0/24):
+# PostUp = ip -4 route replace 10.0.0.0/8 via 192.168.1.1 dev eth0
+# PreDown = ip -4 route del 10.0.0.0/8 via 192.168.1.1 dev eth0 2>/dev/null || true
+
+# --- Optional nftables Kill-Switch (nftables v1.1.3) ---
+# Uses an isolated 'table inet wg_killswitch' (never flushes /etc/nftables.conf
+# 'table inet filter' or wg-quick's own 'table ip wg-quick-wg0').
+# Single-line PostUp/PostDown hooks only (wg-quick rejects multiline heredocs and '\').
+# Alternatively, copy deploy/wireguard/killswitch.nft.example to /etc/wireguard/killswitch.nft
+# and load it with: PostUp = /usr/sbin/nft -f /etc/wireguard/killswitch.nft
+#
+# To enable the inline kill-switch, uncomment the PostUp/PostDown lines below:
+# PostUp = /usr/sbin/nft delete table inet wg_killswitch 2>/dev/null || true
+# PostUp = /usr/sbin/nft add table inet wg_killswitch
+# PostUp = /usr/sbin/nft 'add chain inet wg_killswitch output { type filter hook output priority 0; policy drop; }'
+# PostUp = /usr/sbin/nft add rule inet wg_killswitch output oifname "lo" accept
+# PostUp = /usr/sbin/nft add rule inet wg_killswitch output ct state established,related accept
+# PostUp = /usr/sbin/nft add rule inet wg_killswitch output ct state invalid drop
+# PostUp = /usr/sbin/nft add rule inet wg_killswitch output oifname "%i" accept
+# Optional anti-DNS-leak drop for LAN DNS 192.168.1.1:53 (uncomment BOTH lines below ONLY
+# after installing openresolv and enabling DNS = <VPN_DNS_IP> over %i; must precede LAN accept):
+# PostUp = /usr/sbin/nft add rule inet wg_killswitch output oifname "eth0" ip daddr 192.168.1.1 udp dport 53 drop
+# PostUp = /usr/sbin/nft add rule inet wg_killswitch output oifname "eth0" ip daddr 192.168.1.1 tcp dport 53 drop
+# Explicit optional LAN DNS allow rules (keep if leaving DNS commented, or rely on 192.168.1.0/24 below):
+# PostUp = /usr/sbin/nft add rule inet wg_killswitch output oifname "eth0" ip daddr 192.168.1.1 udp dport 53 accept
+# PostUp = /usr/sbin/nft add rule inet wg_killswitch output oifname "eth0" ip daddr 192.168.1.1 tcp dport 53 accept
+# Allow LAN & SSH traffic on 192.168.1.0/24:
+# PostUp = /usr/sbin/nft add rule inet wg_killswitch output oifname "eth0" ip daddr 192.168.1.0/24 accept
+# Allow DHCP client renewals on eth0 (ports 67/68):
+# PostUp = /usr/sbin/nft add rule inet wg_killswitch output oifname "eth0" udp sport 68 udp dport 67 accept
+# Allow WireGuard encrypted outer UDP socket via wg-quick's fwmark:
+# PostUp = /usr/sbin/nft add rule inet wg_killswitch output oifname "eth0" meta mark $(wg show %i fwmark) accept
+# Optional alternative if fwmark / Table=off is used (replace <VPN_ENDPOINT_IP> and <VPN_ENDPOINT_PORT>):
+# PostUp = /usr/sbin/nft add rule inet wg_killswitch output oifname "eth0" ip daddr <VPN_ENDPOINT_IP> udp dport <VPN_ENDPOINT_PORT> accept
+# PostDown = /usr/sbin/nft delete table inet wg_killswitch 2>/dev/null || true
+
+[Peer]
+PublicKey = <SERVER_PUBLIC_KEY>
+# Optional preshared key (uncomment if provided by your WireGuard peer):
+# PresharedKey = <PRESHARED_KEY_OPTIONAL>
+Endpoint = <VPN_ENDPOINT_IP:PORT>
+PersistentKeepalive = 25
+
+# Full IPv4 tunnel (default):
+# Note on IPv6 (::/0): /etc/sysctl.d/99-disable-ipv6.conf on 192.168.1.164 sets
+# net.ipv6.conf.{all,default,lo}.disable_ipv6 = 1. Including '::/0' while IPv6 is
+# disabled causes 'ip -6' inside wg-quick to fail with 'RTNETLINK answers: Permission denied'.
+# With disable_ipv6 = 1, IPv6 traffic is already blocked kernel-wide (no IPv6 leak).
+# To later enable dual-stack IPv4+IPv6 tunneling (0.0.0.0/0, ::/0):
+#   1. Edit /etc/sysctl.d/99-disable-ipv6.conf (or set sysctl = 0) and apply:
+#        sysctl -w net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.default.disable_ipv6=0 net.ipv6.conf.eth0.disable_ipv6=0
+#   2. Update Address above to include <CLIENT_VPN_IPV6/128>
+#   3. Replace AllowedIPs below with:
+#        AllowedIPs = 0.0.0.0/0, ::/0
+AllowedIPs = 0.0.0.0/0

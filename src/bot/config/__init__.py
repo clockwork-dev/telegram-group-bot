@@ -1,0 +1,47 @@
+"""Configuration Subsystem Package."""
+
+from bot.config.manager import ConfigManager
+from bot.config.models import (
+    AntigravityProviderConfig,
+    BehaviorConfig,
+    BotConfig,
+    CronDigestJobConfig,
+    FriendProfile,
+    FriendsConfig,
+    MediaConfig,
+    MemoryConfig,
+    ModelRoleConfig,
+    ModelRouterConfig,
+    ProactiveConfig,
+    QuietHoursConfig,
+    QuotaConfig,
+    SelfEvolutionConfig,
+    SpontaneousRepliesConfig,
+    STTConfig,
+    TelegramConfig,
+    TTSConfig,
+    VoiceConfig,
+)
+
+__all__ = [
+    "AntigravityProviderConfig",
+    "BehaviorConfig",
+    "BotConfig",
+    "ConfigManager",
+    "CronDigestJobConfig",
+    "FriendProfile",
+    "FriendsConfig",
+    "MediaConfig",
+    "MemoryConfig",
+    "ModelRoleConfig",
+    "ModelRouterConfig",
+    "ProactiveConfig",
+    "QuietHoursConfig",
+    "QuotaConfig",
+    "SelfEvolutionConfig",
+    "SpontaneousRepliesConfig",
+    "STTConfig",
+    "TelegramConfig",
+    "TTSConfig",
+    "VoiceConfig",
+]

@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch self-deploy request trigger for Telegram Group Bot
+
+[Path]
+PathExists=/opt/telegram-group-bot/data/self_deploy/request.json
+Unit=telegram-self-deploy.service
+
+[Install]
+WantedBy=multi-user.target

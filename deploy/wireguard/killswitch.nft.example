@@ -1,0 +1,58 @@
+# Standalone optional nftables kill-switch template for 192.168.1.164 (nftables v1.1.3)
+#
+# Uses an isolated 'table inet wg_killswitch' so it never flushes /etc/nftables.conf
+# ('table inet filter') or wg-quick's own 'table ip wg-quick-wg0' mangle table.
+#
+# Usage:
+#   cp deploy/wireguard/killswitch.nft.example /etc/wireguard/killswitch.nft
+#   chmod 0600 /etc/wireguard/killswitch.nft
+#   nft -c -f /etc/wireguard/killswitch.nft
+#
+# In /etc/wireguard/wg0.conf:
+#   PostUp = /usr/sbin/nft delete table inet wg_killswitch 2>/dev/null || true; /usr/sbin/nft -f /etc/wireguard/killswitch.nft
+#   PostDown = /usr/sbin/nft delete table inet wg_killswitch 2>/dev/null || true
+
+table inet wg_killswitch {
+    chain input {
+        type filter hook input priority filter; policy drop;
+        iifname "lo" accept
+        ct state established,related accept
+        ct state invalid drop
+        iifname "eth0" ip saddr 192.168.1.0/24 tcp dport 22 accept
+        iifname "eth0" ip saddr 192.168.1.0/24 udp sport 67 udp dport 68 accept
+        iifname "eth0" ip saddr 192.168.1.0/24 icmp type echo-request accept
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+    }
+
+    chain output {
+        type filter hook output priority filter; policy drop;
+        oifname "lo" accept
+        ct state established,related accept
+        ct state invalid drop
+        oifname "wg0" accept
+
+        # Anti-DNS-leak option: uncomment BOTH drop lines below if you install openresolv
+        # and configure DNS = <VPN_DNS_IP> in /etc/wireguard/wg0.conf (must precede LAN accept):
+        # oifname "eth0" ip daddr 192.168.1.1 udp dport 53 drop
+        # oifname "eth0" ip daddr 192.168.1.1 tcp dport 53 drop
+
+        # Optional explicit LAN DNS rules (192.168.1.1:53):
+        oifname "eth0" ip daddr 192.168.1.1 udp dport 53 accept
+        oifname "eth0" ip daddr 192.168.1.1 tcp dport 53 accept
+
+        # Preserve LAN & SSH access on 192.168.1.0/24:
+        oifname "eth0" ip daddr 192.168.1.0/24 accept
+
+        # Allow DHCP client renewals on eth0 (ports 67/68):
+        oifname "eth0" udp sport 68 udp dport 67 accept
+
+        # Allow WireGuard encrypted outer UDP traffic using wg-quick's default fwmark (51820 = 0xca6c).
+        # If you set a custom Table/FwMark or Table=off, replace this rule with the explicit endpoint
+        # rule below (substituting <VPN_ENDPOINT_IP> and <VPN_ENDPOINT_PORT>):
+        oifname "eth0" meta mark 0xca6c accept
+        # oifname "eth0" ip daddr <VPN_ENDPOINT_IP> udp dport <VPN_ENDPOINT_PORT> accept
+    }
+}
