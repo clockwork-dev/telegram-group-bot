@@ -729,8 +729,11 @@ async def test_prod_t3_02_f4_admin_dm_plus_f5_ops_tool_profile(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_prod_t3_03_f4_group_user_plus_f5_chat_tool_profile(tmp_path: Path):
-    """F4 + F5: Admin user speaking in public group MUST still get tool_profile='chat', never 'ops'."""
-    cfg_mgr = _make_isolated_config(tmp_path)
+    """F4 + F5: Under admin-only ops mode, admin speaking in public group gets tool_profile='chat', never 'ops'."""
+    cfg_mgr = _make_isolated_config(
+        tmp_path,
+        extra_bot_cfg={"antigravity": {"ops_tools_default_mode": "admin"}},
+    )
     store = MemoryStore(str(tmp_path / "mem.sqlite"))
     await store.init_db()
     userbot = _make_fake_userbot()
@@ -1213,8 +1216,10 @@ async def test_prod_t3_12_f10_context_summary_plus_f3_system_prompt_in_group_tur
         prompt = captured[0].get("prompt") or ""
         combined = f"{sys_inst}\n{prompt}"
         summary = qm.format_context_summary()
+        hint = qm.format_context_hint()
         assert any(w in sys_inst.lower() for w in ("пират", "торрент", "незакон", "закон"))
-        assert summary.strip() and summary.strip() in combined
+        assert "[Quota & Model Context:" not in sys_inst
+        assert summary.strip() and hint.strip() and hint.strip() in combined
     finally:
         await orch.stop()
 
@@ -1492,13 +1497,14 @@ async def test_t3_p1_self_edit_vs_chat_tool_profile_isolation(tmp_path: Path):
     cfg_mgr = _make_isolated_config(
         tmp_path,
         extra_bot_cfg={
+            "antigravity": {"ops_tools_default_mode": "admin"},
             "self_evolution": {
                 "enabled": True,
                 "staging_dir": str(sandbox.staging_dir),
                 "prod_dir": str(sandbox.prod_dir),
                 "request_file": str(sandbox.request_file),
                 "result_file": str(sandbox.result_file),
-            }
+            },
         },
     )
     store = MemoryStore(str(tmp_path / "mem.sqlite"))
@@ -1582,13 +1588,14 @@ async def test_t3_p2_admin_dm_routing_gates_self_edit(tmp_path: Path):
     cfg_mgr = _make_isolated_config(
         tmp_path,
         extra_bot_cfg={
+            "antigravity": {"ops_tools_default_mode": "admin"},
             "self_evolution": {
                 "enabled": True,
                 "staging_dir": str(sandbox.staging_dir),
                 "prod_dir": str(sandbox.prod_dir),
                 "request_file": str(sandbox.request_file),
                 "result_file": str(sandbox.result_file),
-            }
+            },
         },
     )
     store = MemoryStore(str(tmp_path / "mem.sqlite"))
@@ -1656,13 +1663,14 @@ async def test_t3_p3_rate_limit_cooldown_and_antichurn_filter(tmp_path: Path):
     cfg_mgr = _make_isolated_config(
         tmp_path,
         extra_bot_cfg={
+            "antigravity": {"ops_tools_default_mode": "admin"},
             "self_evolution": {
                 "enabled": True,
                 "staging_dir": str(sandbox.staging_dir),
                 "prod_dir": str(sandbox.prod_dir),
                 "request_file": str(sandbox.request_file),
                 "result_file": str(sandbox.result_file),
-            }
+            },
         },
     )
     store = MemoryStore(str(tmp_path / "mem.sqlite"))
@@ -1880,13 +1888,14 @@ async def test_t3_p6_gatekeeper_report_sanitizes_secrets_in_dm_and_logs(tmp_path
     cfg_mgr = _make_isolated_config(
         tmp_path,
         extra_bot_cfg={
+            "antigravity": {"ops_tools_default_mode": "admin"},
             "self_evolution": {
                 "enabled": True,
                 "staging_dir": str(sandbox.staging_dir),
                 "prod_dir": str(sandbox.prod_dir),
                 "request_file": str(sandbox.request_file),
                 "result_file": str(sandbox.result_file),
-            }
+            },
         },
     )
     store = MemoryStore(str(tmp_path / "mem.sqlite"))
@@ -2063,13 +2072,14 @@ async def test_t3_p11_self_edit_persists_usage_info_to_sqlite(tmp_path: Path):
     cfg_mgr = _make_isolated_config(
         tmp_path,
         extra_bot_cfg={
+            "antigravity": {"ops_tools_default_mode": "admin"},
             "self_evolution": {
                 "enabled": True,
                 "staging_dir": str(sandbox.staging_dir),
                 "prod_dir": str(sandbox.prod_dir),
                 "request_file": str(sandbox.request_file),
                 "result_file": str(sandbox.result_file),
-            }
+            },
         },
     )
     store = MemoryStore(str(tmp_path / "mem.sqlite"))
@@ -2275,13 +2285,14 @@ async def test_t3_p15_gatekeeper_tests_failed_triggers_model_escalation(tmp_path
     cfg_mgr = _make_isolated_config(
         tmp_path,
         extra_bot_cfg={
+            "antigravity": {"ops_tools_default_mode": "admin"},
             "self_evolution": {
                 "enabled": True,
                 "staging_dir": str(sandbox.staging_dir),
                 "prod_dir": str(sandbox.prod_dir),
                 "request_file": str(sandbox.request_file),
                 "result_file": str(sandbox.result_file),
-            }
+            },
         },
     )
     store = MemoryStore(str(tmp_path / "mem.sqlite"))

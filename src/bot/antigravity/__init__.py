@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Collection, Sequence
 from pathlib import Path
 from typing import Optional
 
@@ -16,6 +16,7 @@ from bot.antigravity.auth import (
     check_antigravity_auth,
     check_antigravity_token_file_evidence,
     check_os_keyring_auth,
+    cleanup_old_antigravity_sessions,
     describe_antigravity_auth_source,
     find_existing_oauth_token,
     resolve_antigravity_binary,
@@ -24,7 +25,11 @@ from bot.antigravity.auth import (
     setup_isolated_home,
     sync_updated_isolated_tokens,
 )
-from bot.antigravity.cli_client import AntigravityCLIClient
+from bot.antigravity.cli_client import (
+    AntigravityCLIClient,
+    write_chat_pre_tool_hook,
+    write_image_pre_tool_hook,
+)
 from bot.antigravity.errors import (
     AntigravityAuthError,
     AntigravityBillingError,
@@ -35,6 +40,10 @@ from bot.antigravity.errors import (
     AntigravityServerError,
     ErrorCategory,
     ErrorVerdict,
+    ImageGenerationError,
+    ImagePolicyRefusalError,
+    ImageTimeoutError,
+    ImageValidationError,
     calculate_backoff,
     classify_error,
     extract_retry_after,
@@ -44,15 +53,17 @@ from bot.antigravity.sdk_client import AntigravitySDKClient, has_gemini_api_key,
 from bot.antigravity.stream import (
     ALWAYS_FORBIDDEN_TOOLS,
     CHAT_ALLOWED_TOOLS,
+    IMAGE_ALLOWED_SUBAGENT_TYPES,
     OPS_ALLOWED_TOOLS,
     SELF_DEV_ALLOWED_TOOLS,
     AntigravityStreamParser,
     StreamChunk,
     ToolProfile,
+    is_allowed_image_subagent_step,
     parse_ndjson_stream,
     resolve_allowed_tools,
 )
-from bot.core.models import MediaAttachment, ProviderResponse, UsageInfo
+from bot.core.models import GeneratedImageResult, MediaAttachment, ProviderResponse, UsageInfo
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +86,8 @@ class AntigravityConfig(BaseModel):
     rate_limit_cooldown_seconds: float = 300.0
     backoff_base: float = 1.0
     backoff_max: float = 30.0
+    turn_timeout_seconds: float = 300.0
+    cleanup_interval_seconds: float = 3600.0
 
 
 class AntigravityProvider:
@@ -84,9 +97,15 @@ class AntigravityProvider:
     Fallback transport: Subprocess CLI adapter (`agy --output-format stream-json`).
     """
 
-    def __init__(self, config: Optional[AntigravityConfig] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[AntigravityConfig] = None,
+        *,
+        on_quota_warning: Optional[Callable[[Optional[str], Optional[float], Optional[str]], None]] = None,
+    ) -> None:
         self.config = config or AntigravityConfig()
         self.data_dir = resolve_antigravity_home(self.config.data_dir)
+        self.on_quota_warning = on_quota_warning
 
         # Shared & per-model rate-limit / billing circuit breaker state
         self._cooldown_until: float = 0.0
@@ -113,7 +132,19 @@ class AntigravityProvider:
                 data_dir=self.data_dir,
                 default_model=self.config.model,
                 default_effort=self.config.effort,
+                turn_timeout_seconds=self.config.turn_timeout_seconds,
+                cleanup_interval_seconds=self.config.cleanup_interval_seconds,
+                on_quota_warning=self.on_quota_warning,
             )
+
+    def set_quota_warning_callback(
+        self,
+        callback: Optional[Callable[[Optional[str], Optional[float], Optional[str]], None]],
+    ) -> None:
+        """Register or replace soft `[quota]` warning callback on provider and CLI adapter."""
+        self.on_quota_warning = callback
+        if self._cli_client is not None:
+            self._cli_client.set_quota_warning_callback(callback)
 
     def _model_cooldown_info(self, model: str) -> tuple[float, str, Optional[ErrorCategory]]:
         entry = self._model_cooldowns.get(model)
@@ -196,27 +227,8 @@ class AntigravityProvider:
         if self._cli_client is not None:
             self._cli_client.close()
 
-    async def generate_response(
-        self,
-        prompt: str,
-        system_instructions: Optional[str] = None,
-        media_attachments: Optional[Sequence[MediaAttachment]] = None,
-        conversation_id: Optional[str] = None,
-        model: Optional[str] = None,
-        effort: Optional[str] = None,
-        tool_profile: ToolProfile = "chat",
-        mode: Optional[str] = None,
-        cwd: Optional[Path | str] = None,
-    ) -> ProviderResponse:
-        """Generate response conforming to PROJECT.md § Interface Contracts.
-
-        Tries direct Python SDK first; automatically falls back to subprocess CLI adapter.
-        Fails fast when the shared rate-limit/billing circuit breaker is active.
-        """
-        resolve_allowed_tools(tool_profile)
-        effective_model = model or self.config.model
-        effective_effort = effort if effort is not None else self.config.effort
-
+    def _raise_if_cooldown_active(self, effective_model: str) -> None:
+        """Fail fast when per-model or global rate-limit/billing cooldown is open."""
         rem_model, reason_model, cat_model = self._model_cooldown_info(effective_model)
         if rem_model > 0.0:
             remaining = rem_model
@@ -269,11 +281,101 @@ class AntigravityProvider:
                 retry_after=remaining,
             )
 
+    def _trip_cooldown_if_applicable(self, exc: Exception, effective_model: str) -> None:
+        """Trip per-model circuit breaker when exception indicates rate limit or billing exhaustion."""
+        verdict = getattr(exc, "verdict", None) or classify_error(exc)
+        if verdict.category in (ErrorCategory.RATE_LIMIT, ErrorCategory.BILLING):
+            retry_after = extract_retry_after(exc)
+            cooldown = (
+                retry_after
+                if retry_after is not None and retry_after > 0
+                else self.config.rate_limit_cooldown_seconds
+            )
+            self.trigger_cooldown(
+                cooldown,
+                reason=str(exc),
+                category=verdict.category,
+                model=effective_model,
+            )
+            logger.warning(
+                "Antigravity %s circuit breaker tripped for %s (%.1fs): %s",
+                verdict.category.value,
+                effective_model,
+                cooldown,
+                exc,
+            )
+
+    async def generate_image(
+        self,
+        prompt: str,
+        *,
+        aspect_ratio: str | None = None,
+        reference_images: list[MediaAttachment] | None = None,
+        model: Optional[str] = None,
+        timeout_seconds: float = 120.0,
+        output_dir: str | Path = "data/tmp/images",
+        max_image_size_mb: float = 20.0,
+        cleanup_artifacts: bool = True,
+    ) -> GeneratedImageResult:
+        """Generate an image natively via isolated `agy` CLI `stream-json` oneshot."""
+        effective_model = (model or "").strip() or self.config.model
+        self._raise_if_cooldown_active(effective_model)
+
+        if self._cli_client is None:
+            raise ImageGenerationError(
+                "Antigravity CLI client is disabled or unavailable for native image generation."
+            )
+
+        try:
+            return await self._cli_client.generate_image(
+                prompt=prompt,
+                aspect_ratio=aspect_ratio,
+                reference_images=reference_images,
+                model=effective_model,
+                timeout_seconds=timeout_seconds,
+                output_dir=output_dir,
+                max_image_size_mb=max_image_size_mb,
+                cleanup_artifacts=cleanup_artifacts,
+            )
+        except Exception as exc:
+            self._trip_cooldown_if_applicable(exc, effective_model)
+            raise
+
+    async def generate_response(
+        self,
+        prompt: str,
+        system_instructions: Optional[str] = None,
+        media_attachments: Optional[Sequence[MediaAttachment]] = None,
+        conversation_id: Optional[str] = None,
+        model: Optional[str] = None,
+        effort: Optional[str] = None,
+        tool_profile: ToolProfile = "chat",
+        mode: Optional[str] = None,
+        cwd: Optional[Path | str] = None,
+        allowed_tools: Optional[frozenset[str] | Collection[str]] = None,
+    ) -> ProviderResponse:
+        """Generate response conforming to PROJECT.md § Interface Contracts.
+
+        Tries direct Python SDK first (when no custom `allowed_tools` restriction is requested);
+        automatically falls back to subprocess CLI adapter.
+        Fails fast when the shared rate-limit/billing circuit breaker is active.
+        """
+        passed_allowed = (
+            frozenset(str(name).strip().lower() for name in allowed_tools if str(name).strip())
+            if allowed_tools is not None
+            else None
+        )
+        resolve_allowed_tools(tool_profile, allowed_tools=passed_allowed)
+        effective_model = model or self.config.model
+        effective_effort = effort if effort is not None else self.config.effort
+
+        self._raise_if_cooldown_active(effective_model)
+
         async def _attempt_call() -> ProviderResponse:
             sdk_error: Optional[Exception] = None
 
-            # 1. Attempt Direct Python SDK
-            if self._sdk_client is not None:
+            # 1. Attempt Direct Python SDK (skipped when explicit allowed_tools isolation is requested)
+            if self._sdk_client is not None and passed_allowed is None:
                 try:
                     try:
                         return await self._sdk_client.generate_response(
@@ -325,20 +427,29 @@ class AntigravityProvider:
                             f"{prompt}"
                         )
 
+                cli_kwargs: dict[str, object] = {
+                    "prompt": augmented_prompt,
+                    "system_instructions": system_instructions,
+                    "media_attachments": media_attachments,
+                    "conversation_id": conversation_id,
+                    "model": effective_model,
+                    "effort": effective_effort,
+                    "tool_profile": tool_profile,
+                    "mode": mode,
+                    "cwd": cwd,
+                }
+                if passed_allowed is not None:
+                    cli_kwargs["allowed_tools"] = passed_allowed
+
                 try:
-                    return await self._cli_client.generate_response(
-                        prompt=augmented_prompt,
-                        system_instructions=system_instructions,
-                        media_attachments=media_attachments,
-                        conversation_id=conversation_id,
-                        model=effective_model,
-                        effort=effective_effort,
-                        tool_profile=tool_profile,
-                        mode=mode,
-                        cwd=cwd,
-                    )
+                    return await self._cli_client.generate_response(**cli_kwargs)  # type: ignore[arg-type]
                 except TypeError as exc:
-                    if tool_profile != "chat" or mode is not None or cwd is not None:
+                    if (
+                        tool_profile != "chat"
+                        or mode is not None
+                        or cwd is not None
+                        or passed_allowed is not None
+                    ):
                         raise
                     err_s = str(exc)
                     if "media_attachments" in err_s:
@@ -373,27 +484,7 @@ class AntigravityProvider:
                 rate_limit_max_attempts=max(1, 1 + self.config.rate_limit_max_retries),
             )
         except Exception as exc:
-            verdict = getattr(exc, "verdict", None) or classify_error(exc)
-            if verdict.category in (ErrorCategory.RATE_LIMIT, ErrorCategory.BILLING):
-                retry_after = extract_retry_after(exc)
-                cooldown = (
-                    retry_after
-                    if retry_after is not None and retry_after > 0
-                    else self.config.rate_limit_cooldown_seconds
-                )
-                self.trigger_cooldown(
-                    cooldown,
-                    reason=str(exc),
-                    category=verdict.category,
-                    model=effective_model,
-                )
-                logger.warning(
-                    "Antigravity %s circuit breaker tripped for %s (%.1fs): %s",
-                    verdict.category.value,
-                    effective_model,
-                    cooldown,
-                    exc,
-                )
+            self._trip_cooldown_if_applicable(exc, effective_model)
             raise
 
 
@@ -414,6 +505,12 @@ __all__ = [
     "CHAT_ALLOWED_TOOLS",
     "ErrorCategory",
     "ErrorVerdict",
+    "GeneratedImageResult",
+    "IMAGE_ALLOWED_SUBAGENT_TYPES",
+    "ImageGenerationError",
+    "ImagePolicyRefusalError",
+    "ImageTimeoutError",
+    "ImageValidationError",
     "MediaAttachment",
     "OPS_ALLOWED_TOOLS",
     "ProviderResponse",
@@ -426,10 +523,12 @@ __all__ = [
     "check_antigravity_auth",
     "check_antigravity_token_file_evidence",
     "check_os_keyring_auth",
+    "cleanup_old_antigravity_sessions",
     "describe_antigravity_auth_source",
     "extract_retry_after",
     "find_existing_oauth_token",
     "has_gemini_api_key",
+    "is_allowed_image_subagent_step",
     "is_sdk_available",
     "parse_ndjson_stream",
     "resolve_allowed_tools",
@@ -439,4 +538,6 @@ __all__ = [
     "run_isolated_antigravity_login",
     "setup_isolated_home",
     "sync_updated_isolated_tokens",
+    "write_chat_pre_tool_hook",
+    "write_image_pre_tool_hook",
 ]

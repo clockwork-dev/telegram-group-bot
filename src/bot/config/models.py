@@ -1,6 +1,6 @@
 """Pydantic v2 Configuration Models for Bot, Telegram, Memory, Friends & Proactive."""
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -165,6 +165,24 @@ class VoiceConfig(BaseModel):
     stt: STTConfig = Field(default_factory=STTConfig)
 
 
+class ImageGenerationConfig(BaseModel):
+    """Native Antigravity image generation limits, delivery thresholds, and cleanup settings."""
+
+    enabled: bool = True
+    allow_natural_language_trigger: bool = True
+    timeout_seconds: float = Field(default=120.0, gt=0.0, le=600.0)
+    max_prompt_chars: int = Field(default=1000, ge=20, le=4000)
+    max_per_user_per_hour: int = Field(default=5, ge=1, le=100)
+    user_cooldown_seconds: float = Field(default=30.0, ge=0.0, le=3600.0)
+    max_per_chat_per_hour: int = Field(default=15, ge=1, le=200)
+    admin_bypass_limits: bool = True
+    output_dir: str = "data/tmp/images"
+    max_image_size_mb: float = Field(default=20.0, gt=0.0, le=45.0)
+    send_as_document_threshold_mb: float = Field(default=9.5, gt=0.0, le=10.0)
+    model: Optional[str] = None
+    cleanup_after_send: bool = True
+
+
 class MemoryBackupConfig(BaseModel):
     """Automated SQLite memory backup settings."""
 
@@ -201,6 +219,17 @@ class AntigravityProviderConfig(BaseModel):
     ops_mode: str = "auto"
     self_dev_mode: str = "auto"
     ops_cwd: Optional[str] = None
+    # Lightweight default workspace for ops turns (no AGENTS.md / repo context).
+    # `ops_cwd`, when set, remains an explicit override.
+    ops_workspace_dir: Optional[str] = "data/ops_workspace"
+    ops_tools_default_mode: Literal["on", "admin", "off"] = "on"
+
+    @field_validator("ops_tools_default_mode", mode="before")
+    @classmethod
+    def _normalize_ops_tools_default_mode(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
 
 
 class ModelRoleConfig(BaseModel):
@@ -314,6 +343,7 @@ class BotConfig(BaseModel):
     media: MediaConfig = Field(default_factory=MediaConfig)
     proactive: ProactiveConfig = Field(default_factory=ProactiveConfig)
     voice: VoiceConfig = Field(default_factory=VoiceConfig)
+    image_generation: ImageGenerationConfig = Field(default_factory=ImageGenerationConfig)
     antigravity: AntigravityProviderConfig = Field(default_factory=AntigravityProviderConfig)
     models: ModelRouterConfig = Field(default_factory=ModelRouterConfig)
     quota: QuotaConfig = Field(default_factory=QuotaConfig)

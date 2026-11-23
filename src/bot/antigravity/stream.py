@@ -7,7 +7,7 @@ import logging
 import re
 from collections import deque
 from collections.abc import Callable, Iterator
-from typing import Any, Literal
+from typing import Any, Literal, NoReturn
 
 from pydantic import BaseModel
 
@@ -16,7 +16,22 @@ from bot.core.models import UsageInfo
 
 logger = logging.getLogger(__name__)
 
-ToolProfile = Literal["chat", "ops", "self_dev"]
+ToolProfile = Literal["chat", "ops", "self_dev", "image"]
+
+IMAGE_ALLOWED_SUBAGENT_TYPES: frozenset[str] = frozenset({"image-generator"})
+_SAFE_NON_TOOL_STEP_TYPES: frozenset[str] = frozenset(
+    {
+        "user_input",
+        "agent_response",
+        "system_message",
+        "thinking",
+        "thought",
+        "reasoning",
+        "planner_response",
+        "status",
+        "metadata",
+    }
+)
 
 _TOOL_CALL_OPEN = "<tool_call>"
 _TOOL_CALL_OPEN_RE = re.compile(r"<tool_call(?:\s[^>]*)?>")
@@ -48,6 +63,13 @@ OPS_ALLOWED_TOOLS: frozenset[str] = frozenset(
         "sed_file",
         "command_status",
         "send_command_input",
+        "invoke_subagent",
+        "define_subagent",
+        "manage_subagents",
+        "manage_task",
+        "send_message",
+        "run_workflow",
+        "schedule",
     }
 )
 
@@ -81,17 +103,10 @@ ALWAYS_FORBIDDEN_TOOLS: frozenset[str] = frozenset(
         "call_mcp_tool",
         "list_resources",
         "read_resource",
-        "define_subagent",
-        "invoke_subagent",
-        "manage_subagents",
-        "manage_task",
         "manage_inbox",
-        "send_message",
         "notebook_edit",
         "notebook_execution",
-        "run_workflow",
         "swarm",
-        "schedule",
         "delete_knowledge",
         "ask_question",
         "ask_permission",
@@ -127,6 +142,10 @@ def resolve_allowed_tools(
         profile_tools = OPS_ALLOWED_TOOLS
     elif tool_profile == "self_dev":
         profile_tools = SELF_DEV_ALLOWED_TOOLS
+    elif tool_profile == "image":
+        # Image profile permits NO generic direct tools; only strictly arg-gated
+        # invoke_subagent(type_name="image-generator") is allowed via is_allowed_image_subagent_step.
+        profile_tools = frozenset()
     else:
         raise ValueError(f"Unsupported Antigravity tool_profile: {tool_profile!r}")
 
@@ -144,21 +163,98 @@ def _extract_native_tool_name(obj: dict[str, Any]) -> str:
         val = obj.get(key)
         if isinstance(val, str) and val.strip():
             return val.strip().lower()
-    tool_info = obj.get("tool_info")
-    if isinstance(tool_info, dict):
-        info_name = (
-            tool_info.get("name")
-            or tool_info.get("tool_name")
-            or tool_info.get("toolName")
-        )
-        if isinstance(info_name, str) and info_name.strip():
-            return info_name.strip().lower()
+    for info_key in ("tool_info", "toolInfo"):
+        tool_info = obj.get(info_key)
+        if isinstance(tool_info, dict):
+            info_name = (
+                tool_info.get("name")
+                or tool_info.get("tool_name")
+                or tool_info.get("toolName")
+            )
+            if isinstance(info_name, str) and info_name.strip():
+                return info_name.strip().lower()
     fn_obj = obj.get("function")
     if isinstance(fn_obj, dict):
         fn_name = fn_obj.get("name")
         if isinstance(fn_name, str) and fn_name.strip():
             return fn_name.strip().lower()
     return ""
+
+
+def _has_tool_or_subagent_payload(obj: dict[str, Any]) -> bool:
+    """Return True if a step_update carries explicit tool or subagent metadata."""
+    return bool(
+        obj.get("tool_name")
+        or obj.get("toolName")
+        or obj.get("toolname")
+        or obj.get("tool")
+        or obj.get("tool_info")
+        or obj.get("toolInfo")
+        or obj.get("function")
+        or obj.get("subagent_info")
+        or obj.get("subagentInfo")
+    )
+
+
+def _extract_subagent_types(obj: dict[str, Any]) -> list[str] | None:
+    """Extract normalized subagent type_name entries if subagent metadata is present."""
+    subagent_info = obj.get("subagent_info")
+    if subagent_info is None:
+        subagent_info = obj.get("subagentInfo")
+    step_type = str(obj.get("step_type") or "").strip().lower()
+    if not isinstance(subagent_info, dict):
+        return [] if step_type == "subagent" else None
+    subagents = subagent_info.get("subagents")
+    if not isinstance(subagents, list):
+        return []
+    types: list[str] = []
+    for entry in subagents:
+        if isinstance(entry, dict):
+            raw_type = (
+                entry.get("type_name")
+                if entry.get("type_name") is not None
+                else (
+                    entry.get("typeName")
+                    if entry.get("typeName") is not None
+                    else entry.get("TypeName")
+                )
+            )
+            if isinstance(raw_type, str) and raw_type.strip():
+                types.append(raw_type.strip().lower())
+    return types
+
+
+def is_allowed_image_subagent_step(obj: dict[str, Any]) -> bool:
+    """Fail-closed check: True ONLY when obj invokes exclusively the 'image-generator' subagent."""
+    tool_name = _extract_native_tool_name(obj)
+    if tool_name != "invoke_subagent":
+        return False
+    subagent_info = obj.get("subagent_info")
+    if subagent_info is None:
+        subagent_info = obj.get("subagentInfo")
+    if not isinstance(subagent_info, dict):
+        return False
+    subagents = subagent_info.get("subagents")
+    if not isinstance(subagents, list) or not subagents:
+        return False
+    for entry in subagents:
+        if not isinstance(entry, dict):
+            return False
+        raw_type = (
+            entry.get("type_name")
+            if entry.get("type_name") is not None
+            else (
+                entry.get("typeName")
+                if entry.get("typeName") is not None
+                else entry.get("TypeName")
+            )
+        )
+        if (
+            not isinstance(raw_type, str)
+            or raw_type.strip().lower() not in IMAGE_ALLOWED_SUBAGENT_TYPES
+        ):
+            return False
+    return True
 
 
 def is_allowed_native_tool(
@@ -172,6 +268,21 @@ def is_allowed_native_tool(
         tool_profile=tool_profile,
         allowed_tools=allowed_tools,
     )
+    step_type = str(obj.get("step_type") or "").strip().lower()
+    has_subagent_info = bool(obj.get("subagent_info") or obj.get("subagentInfo"))
+    if tool_profile == "image":
+        if step_type == "subagent" or has_subagent_info:
+            return is_allowed_image_subagent_step(obj)
+        return False
+    if step_type == "subagent" or has_subagent_info:
+        if tool_profile not in ("ops", "self_dev"):
+            return False
+        tool_name = _extract_native_tool_name(obj)
+        if tool_name:
+            if tool_name in ALWAYS_FORBIDDEN_TOOLS:
+                return False
+            return tool_name in resolved_allowed
+        return "invoke_subagent" in resolved_allowed
     tool_name = _extract_native_tool_name(obj)
     if not tool_name:
         return False
@@ -257,6 +368,59 @@ class AntigravityStreamParser:
             allowed_tools=self.allowed_tools,
             tool_profile=self.tool_profile,
         )
+
+    def _is_allowed_step(self, obj: dict[str, Any], *, step_type: str = "") -> bool:
+        norm_type = step_type.strip().lower() if step_type else str(obj.get("step_type") or "").strip().lower()
+        has_subagent_info = bool(obj.get("subagent_info") or obj.get("subagentInfo"))
+        if self.tool_profile == "image":
+            if norm_type == "subagent" or has_subagent_info:
+                return is_allowed_image_subagent_step(obj)
+            return False
+        if norm_type == "subagent" or has_subagent_info:
+            if self.tool_profile not in ("ops", "self_dev"):
+                return False
+            tool_name = _extract_native_tool_name(obj)
+            if tool_name:
+                if tool_name in ALWAYS_FORBIDDEN_TOOLS:
+                    return False
+                return tool_name in self.allowed_tools
+            return "invoke_subagent" in self.allowed_tools
+        return self._is_allowed_tool(obj)
+
+    def _raise_native_tool_abort(
+        self,
+        obj: dict[str, Any],
+        *,
+        source: str,
+        step_type: str = "",
+    ) -> NoReturn:
+        self.native_tool_intercepted = True
+        if self._on_native_tool_intercept:
+            self._on_native_tool_intercept()
+        tool_name = _extract_native_tool_name(obj)
+        subagents = _extract_subagent_types(obj)
+        payload_keys = sorted(str(k) for k in obj.keys())
+        abort_exc = AntigravityNativeToolAbort.from_context(
+            tool_profile=self.tool_profile,
+            source=source,
+            step_type=step_type or str(obj.get("step_type") or "").strip().lower(),
+            tool_name=tool_name,
+            subagents=subagents,
+            payload_keys=payload_keys,
+        )
+        safe_keys = abort_exc.payload_keys[:12]
+        keys_suffix = f", keys={','.join(safe_keys)}" if safe_keys else ""
+        logger.warning(
+            "Native tool execution intercepted: tool_profile=%s, source=%s, step_type=%s, tool_name=%s, subagents=%s%s",
+            abort_exc.tool_profile or "",
+            abort_exc.source or "",
+            abort_exc.step_type or "",
+            abort_exc.tool_name or "",
+            ",".join(abort_exc.subagents) if abort_exc.subagents else "none",
+            keys_suffix,
+        )
+        setattr(abort_exc, "_native_tool_abort_logged", True)
+        raise abort_exc
 
     def _parse_tool_call_json(self, raw: str, index: int) -> dict[str, Any] | None:
         """Parse raw XML tool call payload into dict if valid JSON."""
@@ -387,14 +551,17 @@ class AntigravityStreamParser:
                         self._on_conversation_id(self.conversation_id)
 
                 step_type = str(step_obj.get("step_type") or "").strip().lower()
-                if step_type == "tool":
-                    if not self._is_allowed_tool(step_obj):
-                        # Native tool interception security trigger
-                        self.native_tool_intercepted = True
-                        if self._on_native_tool_intercept:
-                            self._on_native_tool_intercept()
-                        raise AntigravityNativeToolAbort(
-                            "Antigravity native tool execution intercepted and terminated"
+                is_tool_or_subagent = step_type in ("tool", "subagent") or (
+                    step_type not in _SAFE_NON_TOOL_STEP_TYPES
+                    and _has_tool_or_subagent_payload(step_obj)
+                )
+                if is_tool_or_subagent:
+                    if not self._is_allowed_step(step_obj, step_type=step_type):
+                        # Native tool or subagent interception security trigger
+                        self._raise_native_tool_abort(
+                            step_obj,
+                            source="step_update",
+                            step_type=step_type,
                         )
                     return list(pending)
 
@@ -426,12 +593,13 @@ class AntigravityStreamParser:
             msg_obj = event.get("message")
             if isinstance(msg_obj, dict):
                 step_type = str(msg_obj.get("step_type") or "").strip().lower()
-                if step_type == "tool" and not self._is_allowed_tool(msg_obj):
-                    self.native_tool_intercepted = True
-                    if self._on_native_tool_intercept:
-                        self._on_native_tool_intercept()
-                    raise AntigravityNativeToolAbort(
-                        "Antigravity native tool execution intercepted and terminated"
+                if step_type in ("tool", "subagent") and not self._is_allowed_step(
+                    msg_obj, step_type=step_type
+                ):
+                    self._raise_native_tool_abort(
+                        msg_obj,
+                        source="assistant",
+                        step_type=step_type,
                     )
 
                 blocks = msg_obj.get("content")
@@ -441,13 +609,19 @@ class AntigravityStreamParser:
                             continue
                         b_step_type = str(block.get("step_type") or "").strip().lower()
                         b_type = str(block.get("type") or "").strip().lower()
-                        if b_step_type == "tool" or b_type in ("tool", "tool_use", "tool_call"):
-                            if not self._is_allowed_tool(block):
-                                self.native_tool_intercepted = True
-                                if self._on_native_tool_intercept:
-                                    self._on_native_tool_intercept()
-                                raise AntigravityNativeToolAbort(
-                                    "Antigravity native tool execution intercepted and terminated"
+                        if b_step_type in ("tool", "subagent") or b_type in (
+                            "tool",
+                            "tool_use",
+                            "tool_call",
+                            "subagent",
+                        ):
+                            if not self._is_allowed_step(
+                                block, step_type=b_step_type or b_type
+                            ):
+                                self._raise_native_tool_abort(
+                                    block,
+                                    source="assistant.content",
+                                    step_type=b_step_type or b_type,
                                 )
                             continue
                         if b_type == "thinking":

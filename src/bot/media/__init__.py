@@ -16,6 +16,20 @@ from bot.media.documents import (
     extract_pdf_text,
     extract_plain_text,
 )
+from bot.media.image_gen import (
+    ALLOWED_ASPECT_RATIOS,
+    IMAGE_INTENT_RE,
+    ImageCommandParseResult,
+    ImageGenerationLimiter,
+    ImageRateLimitError,
+    ImageRequestSpec,
+    ValidatedImageInfo,
+    extract_image_specs,
+    normalize_aspect_ratio,
+    parse_imagine_command,
+    should_send_as_document,
+    validate_image_bytes,
+)
 from bot.media.processor import MediaProcessor, ProcessedMedia
 from bot.media.stt import (
     STTDurationError,
@@ -73,4 +87,16 @@ __all__ = [
     "sanitize_text_for_tts",
     "transcode_to_telegram_voice",
     "probe_audio_duration",
+    "ALLOWED_ASPECT_RATIOS",
+    "IMAGE_INTENT_RE",
+    "ImageCommandParseResult",
+    "ImageGenerationLimiter",
+    "ImageRateLimitError",
+    "ImageRequestSpec",
+    "ValidatedImageInfo",
+    "extract_image_specs",
+    "normalize_aspect_ratio",
+    "parse_imagine_command",
+    "should_send_as_document",
+    "validate_image_bytes",
 ]

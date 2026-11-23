@@ -59,6 +59,9 @@ def is_transient_external_error(exc: Exception | str) -> bool:
 class SelfEvolutionManager:
     """Manages safe autonomous & admin-driven self-modification in staging worktree."""
 
+    _MAX_ERROR_WINDOWS = 256
+    _GIT_SUBPROCESS_TIMEOUT = 30.0
+
     def __init__(
         self,
         config_mgr: ConfigManager,
@@ -221,13 +224,31 @@ class SelfEvolutionManager:
             f"Описание: {reason}\n\n"
             'Верни строго JSON: {"verdict": "NO_CHANGE" | "CONFIG_ONLY" | "CODE_FIX_REQUIRED", "reason": "..."}'
         )
-        resp = await self.provider.generate_response(
-            prompt=judge_prompt,
-            system_instructions="You are a strict adversarial code-change gatekeeper. Return JSON only.",
-            model=judge_model,
-            effort=judge_effort,
-            tool_profile="chat",
+        judge_system_instructions = (
+            "You are a strict adversarial code-change gatekeeper. "
+            "Do NOT invoke any tools, web searches, commands, or file reads; "
+            "judge strictly from the provided description and return JSON only."
         )
+        try:
+            resp = await self.provider.generate_response(
+                prompt=judge_prompt,
+                system_instructions=judge_system_instructions,
+                model=judge_model,
+                effort=judge_effort,
+                tool_profile="chat",
+                allowed_tools=frozenset(),
+            )
+        except TypeError as exc:
+            err_s = str(exc)
+            if "allowed_tools" not in err_s and "unexpected keyword" not in err_s:
+                raise
+            resp = await self.provider.generate_response(
+                prompt=judge_prompt,
+                system_instructions=judge_system_instructions,
+                model=judge_model,
+                effort=judge_effort,
+                tool_profile="chat",
+            )
         if getattr(resp, "usage", None) is not None:
             await self.quota_manager.record_usage(
                 resp.usage,
@@ -252,6 +273,7 @@ class SelfEvolutionManager:
             ["git", "-C", str(staging_dir), "status", "--porcelain"],
             capture_output=True,
             text=True,
+            timeout=self._GIT_SUBPROCESS_TIMEOUT,
         )
         changed_files: List[str] = []
         for line in status_proc.stdout.splitlines():
@@ -270,13 +292,18 @@ class SelfEvolutionManager:
             for prot in protected:
                 p_norm = prot.strip().lstrip("./")
                 if norm == p_norm or (p_norm.endswith("/") and norm.startswith(p_norm)):
-                    subprocess.run(["git", "-C", str(staging_dir), "checkout", "--", rel], capture_output=True)
+                    subprocess.run(
+                        ["git", "-C", str(staging_dir), "checkout", "--", rel],
+                        capture_output=True,
+                        timeout=self._GIT_SUBPROCESS_TIMEOUT,
+                    )
                     return False, f"protected path modified: {norm}", "", "", changed_files, 0
 
         diff_proc = subprocess.run(
             ["git", "-C", str(staging_dir), "diff", "--numstat"],
             capture_output=True,
             text=True,
+            timeout=self._GIT_SUBPROCESS_TIMEOUT,
         )
         diff_lines = 0
         for line in diff_proc.stdout.splitlines():
@@ -299,21 +326,34 @@ class SelfEvolutionManager:
         branch = subprocess.check_output(
             ["git", "-C", str(staging_dir), "rev-parse", "--abbrev-ref", "HEAD"],
             text=True,
+            timeout=self._GIT_SUBPROCESS_TIMEOUT,
         ).strip()
         if branch in ("HEAD", "main", "master"):
             safe_slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", signature)[:32].strip("-") or "fix"
             branch = f"auto-self-edit/{safe_slug}-{int(time.time())}"
-            subprocess.run(["git", "-C", str(staging_dir), "checkout", "-b", branch], check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-C", str(staging_dir), "checkout", "-b", branch],
+                check=True,
+                capture_output=True,
+                timeout=self._GIT_SUBPROCESS_TIMEOUT,
+            )
 
-        subprocess.run(["git", "-C", str(staging_dir), "add", "--", *changed_files], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(staging_dir), "add", "--", *changed_files],
+            check=True,
+            capture_output=True,
+            timeout=self._GIT_SUBPROCESS_TIMEOUT,
+        )
         subprocess.run(
             ["git", "-C", str(staging_dir), "-c", "user.name=BotOps", "-c", "user.email=botops@localhost", "commit", "-m", f"self-edit: {signature}"],
             check=True,
             capture_output=True,
+            timeout=self._GIT_SUBPROCESS_TIMEOUT,
         )
         commit_sha = subprocess.check_output(
             ["git", "-C", str(staging_dir), "rev-parse", "HEAD"],
             text=True,
+            timeout=self._GIT_SUBPROCESS_TIMEOUT,
         ).strip()
         return True, "committed", branch, commit_sha, changed_files, diff_lines
 
@@ -474,7 +514,8 @@ class SelfEvolutionManager:
             await self._send_admin_report(f"⚠️ Self-Edit прерван: {summary}")
             return rec
 
-        ok, msg, branch, commit_sha, changed_files, diff_lines = self._inspect_and_commit_staging(
+        ok, msg, branch, commit_sha, changed_files, diff_lines = await asyncio.to_thread(
+            self._inspect_and_commit_staging,
             staging_dir=staging_dir,
             signature=signature,
             reason=reason,
@@ -538,12 +579,27 @@ class SelfEvolutionManager:
 
         sig = signature or f"{type(exc).__name__}:{str(exc)[:80]}"
         now_ts = time.time()
+        cutoff = now_ts - float(cfg.error_window_seconds)
+        if len(self._error_windows) >= self._MAX_ERROR_WINDOWS:
+            for old_sig, old_win in list(self._error_windows.items()):
+                while old_win and old_win[0] < cutoff:
+                    old_win.popleft()
+                if not old_win:
+                    self._error_windows.pop(old_sig, None)
+            while len(self._error_windows) >= self._MAX_ERROR_WINDOWS:
+                oldest_sig = min(
+                    self._error_windows,
+                    key=lambda k: self._error_windows[k][-1] if self._error_windows[k] else 0.0,
+                )
+                self._error_windows.pop(oldest_sig, None)
+
         win = self._error_windows[sig]
         win.append(now_ts)
-        cutoff = now_ts - float(cfg.error_window_seconds)
         while win and win[0] < cutoff:
             win.popleft()
         if len(win) < int(cfg.error_threshold_count):
+            if not win:
+                self._error_windows.pop(sig, None)
             return None
 
         allowed_daily, _ = self._sync_check_daily_limit()
@@ -558,31 +614,41 @@ class SelfEvolutionManager:
         if not allow_quota:
             return None
 
-        win.clear()
+        self._error_windows.pop(sig, None)
         return await self._execute_evolution_pipeline(
             trigger_type="runtime_error",
             signature=sig,
             reason=f"{type(exc).__name__}: {exc}",
         )
 
-    async def run_admin_task(self, user_id: int, task: str) -> Optional[SelfEditRecord]:
-        """Execute an explicit self-edit task requested by an authorized admin in DM."""
+    async def run_admin_task(
+        self,
+        user_id: int,
+        task: str,
+        *,
+        allow_non_admin: bool = False,
+    ) -> Optional[SelfEditRecord]:
+        """Execute an explicit self-edit task requested by an authorized user."""
         bot_cfg = self.config_mgr.bot
         if bot_cfg is None or not bot_cfg.self_evolution.enabled:
             return None
         admin_ids = {int(uid) for uid in (getattr(bot_cfg.telegram, "admin_user_ids", []) or [])}
-        if int(user_id) not in admin_ids:
+        is_admin = int(user_id) in admin_ids
+        if not is_admin and not allow_non_admin:
             logger.warning("Rejected non-admin self_edit task from user_id=%s", user_id)
             return None
 
-        allow_quota, reason_q = self.quota_manager.should_allow_self_edit(priority="admin")
+        allow_quota, reason_q = self.quota_manager.should_allow_self_edit(
+            priority="admin" if is_admin else "auto"
+        )
         if not allow_quota:
             await self._send_admin_report(f"⚠️ Self-Edit отложен по квоте: {reason_q}")
             return None
 
-        sig = f"dm:{hashlib.sha256(task.strip().encode('utf-8')).hexdigest()[:12]}"
+        sig_prefix = "dm" if is_admin else "ops"
+        sig = f"{sig_prefix}:{hashlib.sha256(task.strip().encode('utf-8')).hexdigest()[:12]}"
         return await self._execute_evolution_pipeline(
-            trigger_type="admin_dm",
+            trigger_type="admin_dm" if is_admin else "ops_chat",
             signature=sig,
             reason=task.strip(),
         )

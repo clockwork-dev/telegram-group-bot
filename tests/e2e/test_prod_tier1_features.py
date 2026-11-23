@@ -1209,7 +1209,7 @@ def test_prod_f5_02_stream_parser_ops_and_self_dev_allow_ops_tools_but_block_bro
             )
         parser.finish()
 
-        for blocked in ("browser_subagent", "call_mcp_tool", "invoke_subagent", "swarm", "schedule"):
+        for blocked in ("browser_subagent", "call_mcp_tool", "swarm", "ask_question", "delete_knowledge"):
             p_block = AntigravityStreamParser(tool_profile=profile)
             with pytest.raises(AntigravityNativeToolAbort):
                 p_block.feed_line(
@@ -1390,7 +1390,8 @@ async def test_prod_f5_05_orchestrator_selects_ops_only_for_admin_dm_and_chat_fo
             "telegram": {
                 "allowed_dm_user_ids": [ADMIN_USER_ID, non_admin_dm],
                 "admin_user_ids": [ADMIN_USER_ID],
-            }
+            },
+            "antigravity": {"ops_tools_default_mode": "admin"},
         },
     )
     store = MemoryStore(db_path=str(tmp_path / "f5_05.sqlite"))
@@ -2395,7 +2396,8 @@ async def test_prod_f10_04_non_admin_cannot_run_quota_command_in_group_or_dm(
             "telegram": {
                 "allowed_dm_user_ids": [ADMIN_USER_ID, other_dm],
                 "admin_user_ids": [ADMIN_USER_ID],
-            }
+            },
+            "antigravity": {"ops_tools_default_mode": "admin"},
         },
     )
     store = MemoryStore(db_path=str(tmp_path / "f10_04.sqlite"))

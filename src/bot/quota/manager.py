@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -60,6 +61,9 @@ class _UsageSample:
 class QuotaBudgetManager:
     """Tracks token budgets in SQLite, per-model/bucket cooldowns, and role-based routing."""
 
+    _DEFAULT_WARNING_TTL_SECONDS = 3600.0
+    _MAX_QUOTA_WARNINGS = 64
+
     def __init__(
         self,
         memory_store: Optional[MemoryStore] = None,
@@ -80,6 +84,7 @@ class QuotaBudgetManager:
 
         self._model_cooldowns: Dict[str, Tuple[float, str]] = {}
         self._bucket_cooldowns: Dict[str, Tuple[float, str]] = {}
+        self._warnings_lock = threading.RLock()
         self._quota_warnings: Dict[str, Dict[str, Any]] = {}
         self._live_quota_rows: List[Dict[str, Any]] = []
         self._usage_samples: Deque[_UsageSample] = deque()
@@ -238,20 +243,51 @@ class QuotaBudgetManager:
             if prev_b is None or until > prev_b[0]:
                 self._bucket_cooldowns[bucket] = (until, reason)
 
+    def _prune_quota_warnings(self, now_dt: Optional[datetime] = None) -> None:
+        """Remove expired quota warnings once `expires_at` / `resets_at` has passed or TTL expires."""
+        with self._warnings_lock:
+            if not self._quota_warnings:
+                return
+            ref = now_dt if now_dt is not None else datetime.now(timezone.utc)
+            for key, warn in list(self._quota_warnings.items()):
+                exp_raw = warn.get("expires_at")
+                exp_dt = _parse_iso_dt(str(exp_raw)) if exp_raw else None
+                if exp_dt is not None:
+                    if ref >= exp_dt:
+                        self._quota_warnings.pop(key, None)
+                    continue
+                rec_raw = warn.get("recorded_at")
+                rec_dt = _parse_iso_dt(str(rec_raw)) if rec_raw else None
+                if rec_dt is None or (ref - rec_dt).total_seconds() >= self._DEFAULT_WARNING_TTL_SECONDS:
+                    self._quota_warnings.pop(key, None)
+            while len(self._quota_warnings) > self._MAX_QUOTA_WARNINGS:
+                oldest_key = next(iter(self._quota_warnings))
+                self._quota_warnings.pop(oldest_key, None)
+
     def record_quota_warning(
         self,
         model: Optional[str],
         remaining_pct: Optional[float],
         resets_at: Optional[str] = None,
     ) -> None:
-        """Record a soft `[quota]` warning without killing active requests."""
+        """Record a soft `[quota]` warning with automatic TTL/reset expiration."""
+        now_dt = datetime.now(timezone.utc)
         key = (model or "unknown").strip()
-        self._quota_warnings[key] = {
-            "model": key,
-            "remaining_pct": remaining_pct,
-            "resets_at": resets_at,
-            "recorded_at": datetime.now(timezone.utc).isoformat(),
-        }
+        reset_dt = _parse_iso_dt(str(resets_at)) if resets_at else None
+        default_exp = now_dt + timedelta(seconds=self._DEFAULT_WARNING_TTL_SECONDS)
+        if reset_dt is not None and reset_dt > now_dt:
+            expires_dt = min(reset_dt, now_dt + timedelta(hours=24))
+        else:
+            expires_dt = default_exp
+        with self._warnings_lock:
+            self._prune_quota_warnings(now_dt)
+            self._quota_warnings[key] = {
+                "model": key,
+                "remaining_pct": remaining_pct,
+                "resets_at": resets_at,
+                "recorded_at": now_dt.isoformat(),
+                "expires_at": expires_dt.isoformat(),
+            }
 
     def is_model_cooled_down(self, model: str) -> bool:
         """Return True if ``model`` or its quota bucket is currently in cooldown."""
@@ -277,7 +313,10 @@ class QuotaBudgetManager:
         """Return True when token usage exceeds budget threshold or low-quota warning is active."""
         if not self.quota_config.enabled:
             return False
-        for warn in self._quota_warnings.values():
+        with self._warnings_lock:
+            self._prune_quota_warnings()
+            warnings_snapshot = list(self._quota_warnings.values())
+        for warn in warnings_snapshot:
             pct = warn.get("remaining_pct")
             if isinstance(pct, (int, float)) and float(pct) <= 20.0:
                 return True
@@ -443,10 +482,16 @@ class QuotaBudgetManager:
                 active[k] = rem
             else:
                 self._model_cooldowns.pop(k, None)
+        for b, (until, _) in list(self._bucket_cooldowns.items()):
+            if until <= now:
+                self._bucket_cooldowns.pop(b, None)
         return active
 
     def format_quota_report(self) -> str:
         """Render a human-readable Telegram report for `/quota`."""
+        with self._warnings_lock:
+            self._prune_quota_warnings()
+            warnings_snapshot = list(self._quota_warnings.values())
         hourly, daily = self.get_usage_totals()
         mode_str = "ECONOMY" if self.is_economy_mode() else "NORMAL"
         lines = [
@@ -468,9 +513,9 @@ class QuotaBudgetManager:
             for m, rem in sorted(active_cd.items()):
                 lines.append(f"• `{m}`: `{rem:.0f}s`")
 
-        if self._quota_warnings:
+        if warnings_snapshot:
             lines.append("\n*Warnings:*")
-            for w in self._quota_warnings.values():
+            for w in warnings_snapshot:
                 lines.append(
                     f"• `{w['model']}`: `{w.get('remaining_pct')}%` (resets `{w.get('resets_at') or '-'}`)"
                 )
@@ -490,4 +535,24 @@ class QuotaBudgetManager:
         return (
             f"[Quota & Model Context: mode={mode_str}, active_group_model={grp_m}, "
             f"tokens_1h={hourly}, tokens_24h={daily}, cooled_down={cd_text}]"
+        )
+
+    def format_context_hint(self) -> str:
+        """Return a compact quota hint ONLY when it is actionable, otherwise an empty string.
+
+        Unlike `format_context_summary()` this never includes rolling token counters (they change
+        on every call and would defeat provider-side Prompt Caching). It is meant to be appended
+        to the *end* of the per-turn prompt (never to the stable system-prompt prefix), and is
+        empty in the normal steady state (mode=normal, no cooldowns).
+        """
+        economy = self.is_economy_mode()
+        active_cd = self._active_cooldowns_snapshot()
+        if not economy and not active_cd:
+            return ""
+        mode_str = "economy" if economy else "normal"
+        cd_text = ", ".join(sorted(active_cd)) or "none"
+        grp_m, _ = self.select_model("group")
+        return (
+            f"[Quota & Model Context: mode={mode_str}, active_group_model={grp_m}, "
+            f"cooled_down={cd_text}]"
         )

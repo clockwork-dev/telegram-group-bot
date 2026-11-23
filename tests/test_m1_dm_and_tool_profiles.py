@@ -242,7 +242,7 @@ async def test_hot_reload_syncs_bot_api_access_lists_and_batch_isolation(tmp_pat
 
 def test_stream_parser_tool_profiles():
     assert CHAT_ALLOWED_TOOLS == frozenset({"search_web", "read_url_content"})
-    assert len(OPS_ALLOWED_TOOLS) == 16
+    assert len(OPS_ALLOWED_TOOLS) == 23
     assert SELF_DEV_ALLOWED_TOOLS == OPS_ALLOWED_TOOLS
 
     # Chat profile blocks FS/shell/browser/MCP/subagent
@@ -274,13 +274,9 @@ def test_stream_parser_tool_profiles():
         for forbidden in (
             "browser_subagent",
             "call_mcp_tool",
-            "invoke_subagent",
-            "run_workflow",
             "swarm",
-            "schedule",
             "delete_knowledge",
             "manage_inbox",
-            "send_message",
             "ask_question",
             "ask_permission",
             "ask_custom_permission",
@@ -585,7 +581,7 @@ async def test_acp_name_before_title_tool_call_update_and_permissions(tmp_path: 
         )
 
     cmd_used, cwd_used, env_used = captured_popen[-1]
-    assert "--add-dir" in cmd_used and str(staging_dir.resolve()) in cmd_used
+    assert "--add-dir" not in cmd_used
     assert cwd_used == str(staging_dir.resolve())
     assert env_used["HOME"] != str(staging_dir.resolve())
     assert Path(env_used["HOME"]) == (tmp_path / "agy_home").resolve()
@@ -656,7 +652,11 @@ async def test_orchestrator_and_proactive_tool_profile_routing(tmp_path: Path):
                     "admin_user_ids": [382962362],
                 },
                 "behavior": {"bot_names": ["Jeff"], "typing_simulation": False},
-                "antigravity": {"ops_mode": "accept-edits", "ops_cwd": str(staging)},
+                "antigravity": {
+                    "ops_mode": "accept-edits",
+                    "ops_cwd": str(staging),
+                    "ops_tools_default_mode": "admin",
+                },
             }
         ),
         encoding="utf-8",

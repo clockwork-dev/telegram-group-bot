@@ -3,8 +3,9 @@
 import asyncio
 import json
 import sqlite3
+import threading
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set
 
@@ -52,19 +53,36 @@ class SelfEditRecord:
 class MemoryStore:
     """Asynchronous Memory Store managing short-term message history and long-term FTS facts."""
 
+    _USAGE_RETENTION_DAYS = 90
+    _USAGE_PRUNE_EVERY_N_WRITES = 200
+
     def __init__(self, db_path: str = "data/memory.sqlite") -> None:
         self.db_path = db_path
         self._conn: Optional[sqlite3.Connection] = None
         self._lock = asyncio.Lock()
+        self._sync_lock = threading.RLock()
+        self._usage_writes_since_prune: int = 0
 
     def _get_connection(self) -> sqlite3.Connection:
-        if self._conn is None:
-            if self.db_path != ":memory:":
-                p = Path(self.db_path)
-                p.parent.mkdir(parents=True, exist_ok=True)
-            self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
-            self._conn.row_factory = sqlite3.Row
-        return self._conn
+        with self._sync_lock:
+            if self._conn is None:
+                if self.db_path != ":memory:":
+                    p = Path(self.db_path)
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                self._conn = sqlite3.connect(
+                    self.db_path,
+                    check_same_thread=False,
+                    timeout=5.0,
+                )
+                self._conn.row_factory = sqlite3.Row
+                try:
+                    self._conn.execute("PRAGMA busy_timeout = 5000")
+                    if self.db_path != ":memory:":
+                        self._conn.execute("PRAGMA journal_mode = WAL")
+                        self._conn.execute("PRAGMA synchronous = NORMAL")
+                except sqlite3.OperationalError:
+                    pass
+            return self._conn
 
     def _sync_init_db(self) -> None:
         conn = self._get_connection()
@@ -119,6 +137,12 @@ class MemoryStore:
             );
             CREATE INDEX IF NOT EXISTS idx_self_edit_created ON self_edit_history(created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_self_edit_sig ON self_edit_history(signature, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
         """)
         conn.commit()
         FTSStore.init_schema(conn)
@@ -130,35 +154,36 @@ class MemoryStore:
             await asyncio.to_thread(self._sync_init_db)
 
     def _sync_save_message(self, msg: ChatMessage) -> None:
-        conn = self._get_connection()
-        conn.execute(
-            """
-            INSERT INTO messages (
-                telegram_msg_id, chat_id, user_id, timestamp, author_name,
-                text, reply_to_msg_id, media_type, media_summary, compacted
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(chat_id, telegram_msg_id) DO UPDATE SET
-                author_name = excluded.author_name,
-                text = excluded.text,
-                reply_to_msg_id = excluded.reply_to_msg_id,
-                media_type = excluded.media_type,
-                media_summary = excluded.media_summary,
-                compacted = excluded.compacted
-            """,
-            (
-                msg.telegram_msg_id,
-                msg.chat_id,
-                msg.user_id,
-                msg.timestamp,
-                msg.author_name,
-                msg.text,
-                msg.reply_to_msg_id,
-                msg.media_type,
-                msg.media_summary,
-                msg.compacted,
-            ),
-        )
-        conn.commit()
+        with self._sync_lock:
+            conn = self._get_connection()
+            conn.execute(
+                """
+                INSERT INTO messages (
+                    telegram_msg_id, chat_id, user_id, timestamp, author_name,
+                    text, reply_to_msg_id, media_type, media_summary, compacted
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, telegram_msg_id) DO UPDATE SET
+                    author_name = excluded.author_name,
+                    text = excluded.text,
+                    reply_to_msg_id = excluded.reply_to_msg_id,
+                    media_type = excluded.media_type,
+                    media_summary = excluded.media_summary,
+                    compacted = MAX(messages.compacted, excluded.compacted)
+                """,
+                (
+                    msg.telegram_msg_id,
+                    msg.chat_id,
+                    msg.user_id,
+                    msg.timestamp,
+                    msg.author_name,
+                    msg.text,
+                    msg.reply_to_msg_id,
+                    msg.media_type,
+                    msg.media_summary,
+                    msg.compacted,
+                ),
+            )
+            conn.commit()
 
     async def save_message(self, msg: ChatMessage) -> None:
         """Store or update a message in rolling short-term history."""
@@ -435,6 +460,15 @@ class MemoryStore:
             conn = self._get_connection()
             await asyncio.to_thread(FTSStore.delete_fact, conn, fact_id)
 
+    def _sync_count_uncompacted(self, chat_id: int) -> int:
+        with self._sync_lock:
+            conn = self._get_connection()
+            row = conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE chat_id = ? AND compacted = 0",
+                (chat_id,),
+            ).fetchone()
+            return int(row[0]) if row else 0
+
     async def compact_old_messages(
         self,
         chat_id: int,
@@ -443,13 +477,9 @@ class MemoryStore:
         batch_size: int = 30,
     ) -> int:
         """Compact messages when uncompacted count reaches threshold."""
-        # Check count of uncompacted messages
+        # Check count of uncompacted messages off the event loop
         async with self._lock:
-            conn = self._get_connection()
-            count = conn.execute(
-                "SELECT COUNT(*) FROM messages WHERE chat_id = ? AND compacted = 0",
-                (chat_id,),
-            ).fetchone()[0]
+            count = await asyncio.to_thread(self._sync_count_uncompacted, chat_id)
 
         if count < threshold:
             return 0
@@ -485,6 +515,24 @@ class MemoryStore:
         await self.mark_compacted(msg_ids)
         return len(msg_ids)
 
+    def _sync_prune_usage_history(self, retention_days: int = _USAGE_RETENTION_DAYS) -> int:
+        if retention_days <= 0:
+            return 0
+        cutoff_iso = (datetime.now(timezone.utc) - timedelta(days=int(retention_days))).isoformat()
+        with self._sync_lock:
+            conn = self._get_connection()
+            cur = conn.execute(
+                "DELETE FROM usage_history WHERE timestamp < ?",
+                (cutoff_iso,),
+            )
+            conn.commit()
+            return int(cur.rowcount or 0)
+
+    async def prune_usage_history(self, retention_days: int = _USAGE_RETENTION_DAYS) -> int:
+        """Delete usage_history rows older than `retention_days`."""
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_prune_usage_history, retention_days)
+
     def _sync_record_usage(
         self,
         *,
@@ -498,27 +546,35 @@ class MemoryStore:
         cache_write_tokens: int,
         total_tokens: int,
     ) -> None:
-        conn = self._get_connection()
-        conn.execute(
-            """
-            INSERT INTO usage_history (
-                timestamp, model, source, input_tokens, output_tokens,
-                reasoning_tokens, cache_read_tokens, cache_write_tokens, total_tokens
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                timestamp,
-                model,
-                source,
-                int(input_tokens),
-                int(output_tokens),
-                int(reasoning_tokens),
-                int(cache_read_tokens),
-                int(cache_write_tokens),
-                int(total_tokens),
-            ),
-        )
-        conn.commit()
+        with self._sync_lock:
+            conn = self._get_connection()
+            conn.execute(
+                """
+                INSERT INTO usage_history (
+                    timestamp, model, source, input_tokens, output_tokens,
+                    reasoning_tokens, cache_read_tokens, cache_write_tokens, total_tokens
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    timestamp,
+                    model,
+                    source,
+                    int(input_tokens),
+                    int(output_tokens),
+                    int(reasoning_tokens),
+                    int(cache_read_tokens),
+                    int(cache_write_tokens),
+                    int(total_tokens),
+                ),
+            )
+            self._usage_writes_since_prune += 1
+            if self._usage_writes_since_prune >= self._USAGE_PRUNE_EVERY_N_WRITES:
+                self._usage_writes_since_prune = 0
+                cutoff_iso = (
+                    datetime.now(timezone.utc) - timedelta(days=self._USAGE_RETENTION_DAYS)
+                ).isoformat()
+                conn.execute("DELETE FROM usage_history WHERE timestamp < ?", (cutoff_iso,))
+            conn.commit()
 
     async def record_usage(
         self,
@@ -549,21 +605,22 @@ class MemoryStore:
             )
 
     def _sync_get_usage_rows(self, since_iso: Optional[str] = None) -> List[Dict[str, Any]]:
-        conn = self._get_connection()
-        if since_iso:
-            rows = conn.execute(
-                "SELECT id, timestamp, model, source, input_tokens, output_tokens, "
-                "reasoning_tokens, cache_read_tokens, cache_write_tokens, total_tokens "
-                "FROM usage_history WHERE timestamp >= ? ORDER BY id ASC",
-                (since_iso,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT id, timestamp, model, source, input_tokens, output_tokens, "
-                "reasoning_tokens, cache_read_tokens, cache_write_tokens, total_tokens "
-                "FROM usage_history ORDER BY id ASC"
-            ).fetchall()
-        return [dict(r) for r in rows]
+        with self._sync_lock:
+            conn = self._get_connection()
+            if since_iso:
+                rows = conn.execute(
+                    "SELECT id, timestamp, model, source, input_tokens, output_tokens, "
+                    "reasoning_tokens, cache_read_tokens, cache_write_tokens, total_tokens "
+                    "FROM usage_history WHERE timestamp >= ? ORDER BY id ASC",
+                    (since_iso,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT id, timestamp, model, source, input_tokens, output_tokens, "
+                    "reasoning_tokens, cache_read_tokens, cache_write_tokens, total_tokens "
+                    "FROM usage_history ORDER BY id ASC"
+                ).fetchall()
+            return [dict(r) for r in rows]
 
     async def get_usage_rows(self, since_iso: Optional[str] = None) -> List[Dict[str, Any]]:
         """Fetch usage_history rows, optionally filtered by ISO timestamp >= since_iso."""
@@ -608,48 +665,101 @@ class MemoryStore:
             return await asyncio.to_thread(self._sync_record_self_edit, record)
 
     def _sync_get_recent_self_edits(self, limit: int = 20) -> List[SelfEditRecord]:
-        conn = self._get_connection()
-        rows = conn.execute(
-            "SELECT * FROM self_edit_history ORDER BY id DESC LIMIT ?",
-            (int(limit),),
-        ).fetchall()
-        out: List[SelfEditRecord] = []
-        for r in rows:
-            try:
-                files = json.loads(r["affected_files"] or "[]")
-                if not isinstance(files, list):
+        with self._sync_lock:
+            conn = self._get_connection()
+            rows = conn.execute(
+                "SELECT * FROM self_edit_history ORDER BY id DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+            out: List[SelfEditRecord] = []
+            for r in rows:
+                try:
+                    files = json.loads(r["affected_files"] or "[]")
+                    if not isinstance(files, list):
+                        files = []
+                except Exception:
                     files = []
-            except Exception:
-                files = []
-            out.append(
-                SelfEditRecord(
-                    id=r["id"],
-                    created_at=r["created_at"],
-                    trigger_type=r["trigger_type"],
-                    signature=r["signature"],
-                    reason=r["reason"],
-                    affected_files=[str(x) for x in files],
-                    verdict=r["verdict"],
-                    model=r["model"],
-                    branch=r["branch"],
-                    commit_sha=r["commit_sha"],
-                    diff_lines=int(r["diff_lines"]),
-                    test_result=r["test_result"],
-                    deploy_result=r["deploy_result"],
-                    rollback_commit=r["rollback_commit"],
-                    summary=r["summary"],
+                out.append(
+                    SelfEditRecord(
+                        id=r["id"],
+                        created_at=r["created_at"],
+                        trigger_type=r["trigger_type"],
+                        signature=r["signature"],
+                        reason=r["reason"],
+                        affected_files=[str(x) for x in files],
+                        verdict=r["verdict"],
+                        model=r["model"],
+                        branch=r["branch"],
+                        commit_sha=r["commit_sha"],
+                        diff_lines=int(r["diff_lines"]),
+                        test_result=r["test_result"],
+                        deploy_result=r["deploy_result"],
+                        rollback_commit=r["rollback_commit"],
+                        summary=r["summary"],
+                    )
                 )
-            )
-        return out
+            return out
 
     async def get_recent_self_edits(self, limit: int = 20) -> List[SelfEditRecord]:
         """Return recent SelfEditRecord entries ordered newest-first."""
         async with self._lock:
             return await asyncio.to_thread(self._sync_get_recent_self_edits, limit)
 
+    def _sync_ensure_settings_table(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+    def _sync_get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT value FROM bot_settings WHERE key = ?",
+                (str(key),),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            self._sync_ensure_settings_table(conn)
+            conn.commit()
+            return default
+        if row is None:
+            return default
+        return str(row["value"])
+
+    async def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        """Read a persisted key-value runtime setting from SQLite."""
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_get_setting, key, default)
+
+    def _sync_set_setting(self, key: str, value: str) -> None:
+        conn = self._get_connection()
+        self._sync_ensure_settings_table(conn)
+        conn.execute(
+            """
+            INSERT INTO bot_settings (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            """,
+            (str(key), str(value), datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+
+    async def set_setting(self, key: str, value: str) -> None:
+        """Persist a key-value runtime setting into SQLite."""
+        async with self._lock:
+            await asyncio.to_thread(self._sync_set_setting, key, value)
+
     async def close(self) -> None:
         """Close database connection."""
         async with self._lock:
-            if self._conn is not None:
-                self._conn.close()
-                self._conn = None
+            with self._sync_lock:
+                if self._conn is not None:
+                    self._conn.close()
+                    self._conn = None

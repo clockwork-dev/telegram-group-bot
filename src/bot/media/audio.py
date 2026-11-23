@@ -51,16 +51,50 @@ def resolve_ffmpeg_path(custom_path: Optional[str] = None) -> str:
     )
 
 
-async def _run_ffmpeg_command(cmd: list[str]) -> None:
-    """Run an FFmpeg command asynchronously via asyncio.subprocess."""
+DEFAULT_FFMPEG_TIMEOUT_SECONDS = 60.0
+
+
+async def _run_ffmpeg_command(
+    cmd: list[str],
+    timeout_seconds: float = DEFAULT_FFMPEG_TIMEOUT_SECONDS,
+) -> None:
+    """Run an FFmpeg command asynchronously with timeout and subprocess cleanup."""
     logger.debug("Executing FFmpeg command: %s", " ".join(cmd))
+    proc: Optional[asyncio.subprocess.Process] = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await proc.communicate()
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(),
+            timeout=max(1.0, float(timeout_seconds)),
+        )
+    except asyncio.TimeoutError as exc:
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await proc.wait()
+            except Exception:
+                pass
+        raise AudioProcessingError(
+            f"FFmpeg command timed out after {timeout_seconds:.1f}s"
+        ) from exc
+    except asyncio.CancelledError:
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await proc.wait()
+            except Exception:
+                pass
+        raise
     except Exception as e:
         raise AudioProcessingError(f"Failed to start FFmpeg process: {e}") from e
 

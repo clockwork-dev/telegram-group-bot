@@ -482,7 +482,10 @@ async def test_t4_s01_group_chat_tool_isolation_usage_and_sanitizer(tmp_path: Pa
     test_log = logging.getLogger("bot.test_t4_s01")
     test_log.addHandler(log_handler)
 
-    cfg_mgr = _make_isolated_config(tmp_path)
+    cfg_mgr = _make_isolated_config(
+        tmp_path,
+        extra_bot_cfg={"antigravity": {"ops_tools_default_mode": "off"}},
+    )
     store = MemoryStore(str(tmp_path / "mem.sqlite"))
     await store.init_db()
     qm = _instantiate_quota_manager(cfg_mgr.bot, store)
@@ -570,7 +573,10 @@ async def test_t4_s02_group_piracy_and_env_exfiltration_defense(tmp_path: Path):
     clean_env = build_clean_child_env(tmp_path / "agy", force_file_auth=True)
     assert "TELEGRAM_BOT_TOKEN" not in clean_env
 
-    cfg_mgr = _make_isolated_config(tmp_path)
+    cfg_mgr = _make_isolated_config(
+        tmp_path,
+        extra_bot_cfg={"antigravity": {"ops_tools_default_mode": "off"}},
+    )
     store = MemoryStore(str(tmp_path / "mem.sqlite"))
     await store.init_db()
     userbot = _make_fake_userbot()

@@ -112,6 +112,21 @@ voice:
       - "uk"
     model_dir: "data/models/whisper"
 
+image_generation:
+  enabled: true
+  allow_natural_language_trigger: true
+  timeout_seconds: 120.0
+  max_prompt_chars: 1000
+  max_per_user_per_hour: 5
+  user_cooldown_seconds: 30.0
+  max_per_chat_per_hour: 15
+  admin_bypass_limits: true
+  output_dir: "data/tmp/images"
+  max_image_size_mb: 20.0
+  send_as_document_threshold_mb: 9.5
+  model: null
+  cleanup_after_send: true
+
 antigravity:
   data_dir: "data/antigravity"
   model: "gemini-4-hydrogen"
@@ -125,7 +140,9 @@ antigravity:
   backoff_max: 30.0
   ops_mode: "auto"
   self_dev_mode: "auto"
-  ops_cwd: null
+  ops_cwd: null # explicit override of the ops working directory (e.g. a repo checkout); null = use ops_workspace_dir
+  ops_workspace_dir: "data/ops_workspace" # lightweight auto-created ops sandbox WITHOUT AGENTS.md (keeps ops prompts small)
+  ops_tools_default_mode: "on" # "on" (all allowed chats), "admin" (admin DMs only), "off" (chat-only safe mode)
 
 models:
   group:

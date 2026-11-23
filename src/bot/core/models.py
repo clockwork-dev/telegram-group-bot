@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -79,6 +80,23 @@ class ProviderResponse(BaseModel):
     raw_response: Optional[Any] = None
 
     model_config = {"arbitrary_types_allowed": True}
+
+
+@dataclass(slots=True)
+class GeneratedImageResult:
+    """Validated image artifact produced by native Antigravity image generation."""
+
+    image_bytes: bytes
+    mime_type: str
+    filename: str
+    width: int = 0
+    height: int = 0
+    prompt_used: str = ""
+    caption_suggestion: str = ""
+    model_used: str = ""
+    conversation_id: Optional[str] = None
+    duration_seconds: float = 0.0
+    usage: dict[str, Any] = field(default_factory=dict)
 
 
 class ChatMessage(BaseModel):

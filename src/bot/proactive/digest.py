@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 from datetime import datetime
 from typing import Any, List, Optional, Sequence, Tuple
@@ -177,8 +178,10 @@ class NewsDigestGenerator:
         self,
         provider: Optional[Any] = None,
         default_system_instructions: Optional[str] = None,
+        quota_manager: Optional[Any] = None,
     ) -> None:
         self.provider = provider
+        self.quota_manager = quota_manager
         self.default_system_instructions = (
             default_system_instructions
             if default_system_instructions is not None
@@ -361,20 +364,37 @@ class NewsDigestGenerator:
                 )
             return None
 
+        chosen_model: Optional[str] = None
+        chosen_effort: Optional[str] = None
+        if self.quota_manager is not None and hasattr(self.quota_manager, "select_model"):
+            try:
+                chosen_model, chosen_effort = self.quota_manager.select_model("proactive")
+            except Exception:
+                chosen_model, chosen_effort = None, None
+
         rate_limiter = getattr(self.provider, "is_rate_limited", None)
-        if callable(rate_limiter) and rate_limiter() is True:
-            logger.info("Skipping news digest '%s' while provider is rate-limited.", effective_label)
-            if fallback_on_error:
-                return self.build_fallback_digest(
-                    slot_name=slot_name,
-                    slot_label=slot_label,
-                    timezone=timezone,
-                    now_dt=now_dt,
-                    topics=topics,
-                    forbidden_topics=forbidden_topics,
-                    sensitive_topics=sensitive_topics,
+        if callable(rate_limiter):
+            try:
+                limited = (
+                    rate_limiter(model=chosen_model) is True
+                    if chosen_model is not None
+                    else rate_limiter() is True
                 )
-            return None
+            except TypeError:
+                limited = rate_limiter() is True
+            if limited:
+                logger.info("Skipping news digest '%s' while provider is rate-limited.", effective_label)
+                if fallback_on_error:
+                    return self.build_fallback_digest(
+                        slot_name=slot_name,
+                        slot_label=slot_label,
+                        timezone=timezone,
+                        now_dt=now_dt,
+                        topics=topics,
+                        forbidden_topics=forbidden_topics,
+                        sensitive_topics=sensitive_topics,
+                    )
+                return None
 
         if not hasattr(self.provider, "generate_response"):
             logger.warning(
@@ -402,18 +422,36 @@ class NewsDigestGenerator:
 
         try:
             try:
-                resp = await self.provider.generate_response(
-                    prompt=prompt,
-                    system_instructions=resolved_sys,
-                    conversation_id=None,
-                    tool_profile="chat",
-                )
+                if chosen_model is not None:
+                    resp = await self.provider.generate_response(
+                        prompt=prompt,
+                        system_instructions=resolved_sys,
+                        conversation_id=None,
+                        model=chosen_model,
+                        effort=chosen_effort,
+                        tool_profile="chat",
+                    )
+                else:
+                    resp = await self.provider.generate_response(
+                        prompt=prompt,
+                        system_instructions=resolved_sys,
+                        conversation_id=None,
+                        tool_profile="chat",
+                    )
             except TypeError:
-                resp = await self.provider.generate_response(
-                    prompt=prompt,
-                    system_instructions=resolved_sys,
-                    conversation_id=None,
-                )
+                try:
+                    resp = await self.provider.generate_response(
+                        prompt=prompt,
+                        system_instructions=resolved_sys,
+                        conversation_id=None,
+                        tool_profile="chat",
+                    )
+                except TypeError:
+                    resp = await self.provider.generate_response(
+                        prompt=prompt,
+                        system_instructions=resolved_sys,
+                        conversation_id=None,
+                    )
         except Exception as exc:
             logger.warning(
                 "Provider error generating news digest for slot '%s': %s",
@@ -431,6 +469,24 @@ class NewsDigestGenerator:
                     sensitive_topics=sensitive_topics,
                 )
             return None
+
+        usage = getattr(resp, "usage", None)
+        if (
+            usage is not None
+            and self.quota_manager is not None
+            and hasattr(self.quota_manager, "record_usage")
+        ):
+            try:
+                model_name = getattr(resp, "model", None) or chosen_model or "unknown"
+                rec = self.quota_manager.record_usage(
+                    usage,
+                    model=model_name,
+                    source="proactive",
+                )
+                if inspect.isawaitable(rec):
+                    await rec
+            except Exception as rec_exc:
+                logger.debug("Failed to record proactive digest usage: %s", rec_exc)
 
         if hasattr(resp, "text"):
             raw_text = resp.text or ""

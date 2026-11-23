@@ -6,7 +6,7 @@ import asyncio
 import logging
 import random
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, TypeVar
@@ -34,6 +34,77 @@ _QUOTA_WARNING_RE = re.compile(r"^\s*(?:\S+\s+)?\[quota\]", re.IGNORECASE)
 _QUOTA_PCT_RE = re.compile(r"(-?\d+(?:\.\d+)?)\s*%")
 _QUOTA_MODEL_RE = re.compile(r"model\s+([A-Za-z0-9._:/-]+)", re.IGNORECASE)
 _UNIT_SECONDS = {"h": 3600.0, "m": 60.0, "s": 1.0}
+
+NATIVE_TOOL_ABORT_PREFIX = "Antigravity native tool execution intercepted and terminated"
+_SAFE_DIAG_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+_DIAG_SECRET_TOKEN_RE = re.compile(
+    r"^(?:sk-|AIza|ya29\.|gh[pousr]_|github_pat_|glpat-|xox[baprs]-|AKIA|ASIA|hf_|eyJ|\d{5,}:[A-Za-z0-9_-]{15,})",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_diag_token(value: Any) -> str:
+    """Return a short safe identifier token for diagnostics, never raw args/prompts/secrets."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if not _SAFE_DIAG_TOKEN_RE.match(text) or _DIAG_SECRET_TOKEN_RE.match(text):
+        return "<redacted>"
+    return text
+
+
+def format_native_tool_abort_message(
+    *,
+    tool_profile: str | None = None,
+    source: str | None = None,
+    step_type: str | None = None,
+    tool_name: str | None = None,
+    subagents: Sequence[str] | None = None,
+    payload_keys: Sequence[str] | None = None,
+) -> str:
+    """Build a concise, secret-free diagnostic message for AntigravityNativeToolAbort."""
+    parts: list[str] = []
+    if tool_profile:
+        safe_profile = _sanitize_diag_token(tool_profile)
+        if safe_profile:
+            parts.append(f"profile={safe_profile}")
+    if source:
+        safe_source = _sanitize_diag_token(source)
+        if safe_source:
+            parts.append(f"source={safe_source}")
+    if step_type:
+        safe_step = _sanitize_diag_token(step_type)
+        if safe_step:
+            parts.append(f"step_type={safe_step}")
+
+    safe_tool = _sanitize_diag_token(tool_name) if tool_name else ""
+    if safe_tool:
+        parts.append(f"tool={safe_tool}")
+
+    if subagents is not None:
+        safe_subs: list[str] = []
+        for entry in subagents:
+            tok = _sanitize_diag_token(entry)
+            if tok and tok not in safe_subs:
+                safe_subs.append(tok)
+            if len(safe_subs) >= 5:
+                break
+        parts.append(f"subagents={','.join(safe_subs) if safe_subs else 'none'}")
+
+    if (not safe_tool or safe_tool == "<redacted>") and payload_keys:
+        safe_keys: list[str] = []
+        for key in sorted({str(k) for k in payload_keys}):
+            tok = _sanitize_diag_token(key)
+            if tok and tok not in safe_keys:
+                safe_keys.append(tok)
+            if len(safe_keys) >= 12:
+                break
+        if safe_keys:
+            parts.append(f"keys={','.join(safe_keys)}")
+
+    if parts:
+        return f"{NATIVE_TOOL_ABORT_PREFIX} ({', '.join(parts)})"
+    return NATIVE_TOOL_ABORT_PREFIX
 
 
 def _exception_text(error: Exception | str) -> str:
@@ -185,9 +256,102 @@ class AntigravityBillingError(AntigravityError):
 class AntigravityNativeToolAbort(AntigravityError):
     """Raised when agy attempts unauthorized host tool execution."""
 
+    def __init__(
+        self,
+        message: str = NATIVE_TOOL_ABORT_PREFIX,
+        verdict: ErrorVerdict | None = None,
+        retry_after: float | None = None,
+        *,
+        tool_profile: str | None = None,
+        source: str | None = None,
+        step_type: str | None = None,
+        tool_name: str | None = None,
+        subagents: Sequence[str] | None = None,
+        payload_keys: Sequence[str] | None = None,
+    ) -> None:
+        if verdict is None:
+            verdict = ErrorVerdict(
+                category=ErrorCategory.NATIVE_TOOL_ABORT,
+                retryable=False,
+                should_compress=False,
+                should_fallback=False,
+                message=message,
+            )
+        super().__init__(message, verdict=verdict, retry_after=retry_after)
+        self.tool_profile = tool_profile
+        self.source = source
+        self.step_type = step_type
+        self.tool_name = tool_name
+        self.subagents = tuple(subagents) if subagents else ()
+        self.payload_keys = tuple(payload_keys) if payload_keys else ()
+
+    @classmethod
+    def from_context(
+        cls,
+        *,
+        tool_profile: str | None = None,
+        source: str | None = None,
+        step_type: str | None = None,
+        tool_name: str | None = None,
+        subagents: Sequence[str] | None = None,
+        payload_keys: Sequence[str] | None = None,
+    ) -> AntigravityNativeToolAbort:
+        """Construct an abort error with safe, structured, secret-free diagnostic context."""
+        safe_profile = _sanitize_diag_token(tool_profile) or None
+        safe_source = _sanitize_diag_token(source) or None
+        safe_step = _sanitize_diag_token(step_type) or None
+        safe_tool = _sanitize_diag_token(tool_name) or None
+        safe_subs = (
+            tuple(_sanitize_diag_token(s) for s in subagents if _sanitize_diag_token(s))
+            if subagents is not None
+            else ()
+        )
+        safe_keys = (
+            tuple(
+                tok
+                for tok in (_sanitize_diag_token(k) for k in sorted({str(k) for k in payload_keys}))
+                if tok
+            )
+            if (not safe_tool or safe_tool == "<redacted>") and payload_keys
+            else ()
+        )
+        msg = format_native_tool_abort_message(
+            tool_profile=tool_profile,
+            source=source,
+            step_type=step_type,
+            tool_name=tool_name,
+            subagents=subagents,
+            payload_keys=payload_keys,
+        )
+        return cls(
+            msg,
+            tool_profile=safe_profile,
+            source=safe_source,
+            step_type=safe_step,
+            tool_name=safe_tool,
+            subagents=safe_subs,
+            payload_keys=safe_keys,
+        )
+
 
 class AntigravityServerError(AntigravityError):
     """Upstream server or output token truncation error."""
+
+
+class ImageGenerationError(AntigravityError):
+    """Base error for Antigravity native image generation failures."""
+
+
+class ImageTimeoutError(ImageGenerationError):
+    """Raised when native image generation exceeds its wall-clock timeout."""
+
+
+class ImagePolicyRefusalError(ImageGenerationError):
+    """Raised when native image generation is refused by safety/content policy."""
+
+
+class ImageValidationError(ImageGenerationError):
+    """Raised when a generated or reference image fails confinement or integrity checks."""
 
 
 def classify_error(error: Exception | str, status_code: int | None = None) -> ErrorVerdict:

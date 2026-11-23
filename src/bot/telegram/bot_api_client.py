@@ -22,7 +22,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional
 
-from bot.telegram.client import calculate_typing_delay, validate_document_path
+from bot.telegram.client import (
+    MAX_DOCUMENT_SIZE_BYTES,
+    calculate_typing_delay,
+    validate_document_path,
+)
 from bot.telegram.handlers import IncomingMessage, MessageDispatcher
 from bot.telegram.heuristics import ReplyHeuristics
 
@@ -85,6 +89,58 @@ def normalize_reaction_emoji(emoji: str) -> str:
     if no_vs in _VALID_TELEGRAM_REACTIONS:
         return no_vs
     return "👍"
+
+
+_TELEGRAM_MAX_CAPTION_LEN = 1024
+
+_MIME_TO_IMAGE_EXT: Dict[str, str] = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+}
+
+
+def _truncate_telegram_caption(caption: Optional[str]) -> Optional[str]:
+    """Truncate caption to Telegram Bot API's 1024-character limit."""
+    if caption is None:
+        return None
+    if len(caption) > _TELEGRAM_MAX_CAPTION_LEN:
+        return caption[: _TELEGRAM_MAX_CAPTION_LEN - 3] + "..."
+    return caption
+
+
+def _infer_image_mime_and_ext(
+    data: bytes,
+    *,
+    mime_type: Optional[str] = None,
+    filename: Optional[str] = None,
+) -> tuple[str, str]:
+    """Infer `(mime_type, extension)` for an image payload from explicit MIME, magic bytes, or filename."""
+    if mime_type and mime_type.strip():
+        norm = mime_type.strip().lower()
+        if norm == "image/jpg":
+            norm = "image/jpeg"
+        ext = _MIME_TO_IMAGE_EXT.get(norm)
+        if ext is not None:
+            return norm, ext
+        guessed_ext = mimetypes.guess_extension(norm) or ".jpg"
+        return norm, guessed_ext
+
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png", ".png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg", ".jpg"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp", ".webp"
+
+    if filename:
+        guessed_mime = mimetypes.guess_type(filename)[0]
+        if guessed_mime:
+            norm = "image/jpeg" if guessed_mime == "image/jpg" else guessed_mime
+            return norm, _MIME_TO_IMAGE_EXT.get(norm, Path(filename).suffix or ".jpg")
+
+    return "image/jpeg", ".jpg"
 
 
 def _encode_multipart_form_data(
@@ -540,14 +596,24 @@ class TelegramBotAPIClient:
     def _sync_send_document(
         self,
         chat_id: int,
-        file_path: Path,
+        file_path: Path | bytes,
         caption: Optional[str] = None,
         reply_to_msg_id: Optional[int] = None,
         filename: Optional[str] = None,
         timeout: float = 120.0,
+        *,
+        mime_type: Optional[str] = None,
     ) -> Dict[str, Any]:
-        effective_filename = Path(filename).name if filename else file_path.name
-        file_bytes = file_path.read_bytes()
+        if isinstance(file_path, (bytes, bytearray)):
+            file_bytes = bytes(file_path)
+            if filename:
+                effective_filename = Path(filename).name
+            else:
+                _, ext = _infer_image_mime_and_ext(file_bytes, mime_type=mime_type)
+                effective_filename = f"generated{ext}" if mime_type or ext else "document"
+        else:
+            effective_filename = Path(filename).name if filename else file_path.name
+            file_bytes = file_path.read_bytes()
 
         fields: Dict[str, str] = {"chat_id": str(int(chat_id))}
         if caption:
@@ -560,6 +626,7 @@ class TelegramBotAPIClient:
             file_field="document",
             filename=effective_filename,
             file_bytes=file_bytes,
+            mime_type=mime_type,
         )
         headers = {
             "Accept": "application/json",
@@ -567,6 +634,49 @@ class TelegramBotAPIClient:
             "Content-Length": str(len(body)),
         }
         return self._sync_execute_request("sendDocument", body, headers, timeout=timeout)
+
+    def _sync_send_photo(
+        self,
+        chat_id: int,
+        photo_bytes: bytes,
+        *,
+        filename: str = "generated.jpg",
+        mime_type: str = "image/jpeg",
+        caption: Optional[str] = None,
+        reply_to_message_id: Optional[int] = None,
+        parse_mode: Optional[str] = None,
+        disable_notification: bool = False,
+        timeout: float = 90.0,
+    ) -> Dict[str, Any]:
+        fields: Dict[str, str] = {"chat_id": str(int(chat_id))}
+        if caption:
+            fields["caption"] = caption
+        if reply_to_message_id is not None:
+            fields["reply_parameters"] = json.dumps(
+                {
+                    "message_id": int(reply_to_message_id),
+                    "allow_sending_without_reply": True,
+                },
+                ensure_ascii=False,
+            )
+        if parse_mode:
+            fields["parse_mode"] = parse_mode
+        if disable_notification:
+            fields["disable_notification"] = "true"
+
+        body, content_type = _encode_multipart_form_data(
+            fields=fields,
+            file_field="photo",
+            filename=filename,
+            file_bytes=photo_bytes,
+            mime_type=mime_type,
+        )
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": content_type,
+            "Content-Length": str(len(body)),
+        }
+        return self._sync_execute_request("sendPhoto", body, headers, timeout=timeout)
 
     def _sync_send_voice(
         self,
@@ -867,16 +977,46 @@ class TelegramBotAPIClient:
     async def send_document(
         self,
         chat_id: int,
-        file_path: str | Path,
+        file_path: str | Path | bytes,
         caption: Optional[str] = None,
         reply_to_msg_id: Optional[int] = None,
         simulate_typing: bool = True,
         filename: Optional[str] = None,
         timeout: float = 120.0,
+        *,
+        mime_type: Optional[str] = None,
+        reply_to_message_id: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Validate file and upload a document via Bot API `POST /sendDocument`."""
-        validated_path = validate_document_path(file_path)
-        safe_caption = self._redact_secrets(caption) if caption is not None else None
+        """Validate file or raw bytes and upload a document via Bot API `POST /sendDocument`."""
+        payload_source: Path | bytes
+        resolved_filename = filename
+        resolved_mime = mime_type
+        if isinstance(file_path, (bytes, bytearray)):
+            raw_bytes = bytes(file_path)
+            if not raw_bytes:
+                raise ValueError("Document bytes cannot be empty.")
+            if len(raw_bytes) > MAX_DOCUMENT_SIZE_BYTES:
+                raise ValueError(
+                    f"Document size ({len(raw_bytes)} bytes) exceeds maximum allowed "
+                    f"({MAX_DOCUMENT_SIZE_BYTES} bytes)."
+                )
+            payload_source = raw_bytes
+            if not resolved_filename:
+                inferred_mime, ext = _infer_image_mime_and_ext(raw_bytes, mime_type=mime_type)
+                resolved_filename = f"generated{ext}"
+                if resolved_mime is None:
+                    resolved_mime = inferred_mime
+        else:
+            payload_source = validate_document_path(file_path)
+
+        effective_reply_id = (
+            reply_to_msg_id if reply_to_msg_id is not None else reply_to_message_id
+        )
+        safe_caption = (
+            _truncate_telegram_caption(self._redact_secrets(caption))
+            if caption is not None
+            else None
+        )
 
         if simulate_typing:
             await self._simulate_chat_action(chat_id, "upload_document", safe_caption or "")
@@ -884,12 +1024,80 @@ class TelegramBotAPIClient:
         return await asyncio.to_thread(
             self._sync_send_document,
             chat_id,
-            validated_path,
+            payload_source,
             safe_caption,
-            reply_to_msg_id,
-            filename,
+            effective_reply_id,
+            resolved_filename,
             timeout,
+            mime_type=resolved_mime,
         )
+
+    async def send_photo(
+        self,
+        chat_id: int,
+        photo: str | Path | bytes,
+        *,
+        caption: str | None = None,
+        filename: str | None = None,
+        mime_type: str | None = None,
+        reply_to_message_id: int | None = None,
+        parse_mode: str | None = None,
+        disable_notification: bool = False,
+        timeout: float = 90.0,
+    ) -> int:
+        """Validate and upload a photo via Bot API `POST /sendPhoto`; returns sent message_id."""
+        if isinstance(photo, (bytes, bytearray)):
+            photo_bytes = bytes(photo)
+            if not photo_bytes:
+                raise ValueError("Photo bytes cannot be empty.")
+            if len(photo_bytes) > MAX_DOCUMENT_SIZE_BYTES:
+                raise ValueError(
+                    f"Photo size ({len(photo_bytes)} bytes) exceeds maximum allowed "
+                    f"({MAX_DOCUMENT_SIZE_BYTES} bytes)."
+                )
+            resolved_mime, ext = _infer_image_mime_and_ext(
+                photo_bytes,
+                mime_type=mime_type,
+                filename=filename,
+            )
+            resolved_filename = Path(filename).name if filename else f"generated{ext}"
+        else:
+            validated_path = validate_document_path(photo)
+            photo_bytes = validated_path.read_bytes()
+            resolved_mime, ext = _infer_image_mime_and_ext(
+                photo_bytes,
+                mime_type=mime_type,
+                filename=filename or validated_path.name,
+            )
+            resolved_filename = (
+                Path(filename).name
+                if filename
+                else (validated_path.name or f"generated{ext}")
+            )
+
+        safe_caption = (
+            _truncate_telegram_caption(self._redact_secrets(caption))
+            if caption is not None
+            else None
+        )
+
+        resp = await asyncio.to_thread(
+            self._sync_send_photo,
+            chat_id,
+            photo_bytes,
+            filename=resolved_filename,
+            mime_type=resolved_mime,
+            caption=safe_caption,
+            reply_to_message_id=reply_to_message_id,
+            parse_mode=parse_mode,
+            disable_notification=disable_notification,
+            timeout=timeout,
+        )
+        result = resp.get("result") if isinstance(resp, dict) else None
+        msg_id = result.get("message_id") if isinstance(result, dict) else None
+        if isinstance(msg_id, int) and not isinstance(msg_id, bool):
+            return msg_id
+        return 0
 
     async def send_voice(
         self,

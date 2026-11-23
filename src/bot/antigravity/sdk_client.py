@@ -122,7 +122,7 @@ class AntigravitySDKClient:
             else list(_SDK_CHAT_TOOLS)
         )
         caps = CapabilitiesConfig(
-            enable_subagents=False,
+            enable_subagents=(tool_profile in ("ops", "self_dev")),
             enabled_tools=enabled_sdk_tools,
         )
 

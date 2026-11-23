@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import re
 import signal
@@ -18,17 +19,31 @@ from PIL import Image
 from bot.antigravity import (
     AntigravityCLIClient,
     AntigravityConfig,
+    AntigravityNativeToolAbort,
     AntigravityProvider,
     ErrorCategory,
+    ImageGenerationError,
+    ImagePolicyRefusalError,
+    ImageTimeoutError,
+    ImageValidationError,
     ToolProfile,
     classify_error,
     extract_retry_after,
 )
 from bot.config.manager import ConfigManager
 from bot.config.models import BotConfig, FriendProfile
-from bot.core.models import MediaAttachment, ProviderResponse
+from bot.core.models import GeneratedImageResult, MediaAttachment, ProviderResponse, UsageInfo
 from bot.documents.builder import DocumentBuilder, GeneratedDocument, extract_document_specs
 from bot.evolution.manager import SelfEvolutionManager
+from bot.media.image_gen import (
+    IMAGE_INTENT_RE,
+    ImageCommandParseResult,
+    ImageGenerationLimiter,
+    ImageRateLimitError,
+    extract_image_specs,
+    parse_imagine_command,
+    should_send_as_document,
+)
 from bot.media.processor import MediaProcessor, ProcessedMedia, _has_media_flag
 from bot.media.stt import STTTranscriber
 from bot.media.tts import TTSSkippedError, TTSSynthesizer
@@ -84,12 +99,28 @@ class GroupBotOrchestrator:
 
     _FACT_COOLDOWN_REPLIES = 5
     _FACT_COOLDOWN_SECONDS = 1800.0
+    _MAX_TRACKED_CHATS = 256
+    _MAX_DEBOUNCE_BUFFER = 50
     _TOOL_INTENT_RE = re.compile(
         r"(?:https?://|\b(?:pdf|docx|xlsx|pptx|word|excel|google|search|news|weather|btc)\b"
         r"|пдф|ворд|эксел|ексел|документ|файл|отч[её]т|звіт|таблиц|слайд|презентац"
         r"|найд[иі]|знайд|поищ|пошук|погугл|гугл|новост|новин|погод|курс|цен[аыу]|цін[аиу]"
         r"|сколько\s+стоит|скільки\s+кошту|кто\s+тако|что\s+тако|що\s+таке|хто\s+так"
         r"|ссылк|посилан|источник|джерел|проверь|перевір|расписан|розклад)",
+        re.IGNORECASE,
+    )
+    _OPS_INTENT_RE = re.compile(
+        r"(?:\b(?:run|exec|execute|restart|reboot|deploy|install|uninstall|delete|remove|edit|"
+        r"create|file|files|dir|folder|ls|cat|grep|git|docker|systemctl|journalctl|ssh|sudo|bash|shell|"
+        r"python|pip|npm|logs|cron|schedule|status|disk|cpu|ram|memory|uptime|inspect|processes|service|"
+        r"server|backup|evolve|quota|subagent|workflow|script|bug|fix|patch)\b"
+        r"|(?:^|\s)(?:/(?:etc|var|opt|home|tmp|usr|proc)/|~/|\./)"
+        r"|запуст|выполни|виконай|перезапуст|перезагруз|рестарт|задеплой|установ|встанови|удали|видали|"
+        r"измени|зміни|отредактир|відредагу|создай|створи|напиши\s+(?:код|скрипт)|прочита|"
+        r"покажи\s+(?:лог|файл|статус|процесс|диск|памят)|логи|команд|терминал|консол|сервер|"
+        r"скрипт|код\b|баг(?:а|и|у|ов|е)?\b|исправ|виправ|почини|пофикс|статус|"
+        r"диск(?:а|е|у|ов)?\b|процесс(?:ы|ов)?\b|служб|сервис|"
+        r"крон|расписани|бэкап|бекап|эволюц|квот|субагент|воркфлоу)",
         re.IGNORECASE,
     )
     _ARCHIVE_CUE_RE = re.compile(
@@ -99,6 +130,8 @@ class GroupBotOrchestrator:
     )
     _SKIP_TAG_RE = re.compile(r"\[SKIP\]", re.IGNORECASE)
     _REACTION_TAG_RE = re.compile(r"\[REACT:\s*([^\[\]\s]+)\s*\]", re.IGNORECASE)
+    _OPS_MODE_SETTING_KEY = "ops_tools_mode"
+    _VALID_OPS_TOOLS_MODES = frozenset({"on", "admin", "off"})
 
     def __init__(
         self,
@@ -115,6 +148,7 @@ class GroupBotOrchestrator:
         sanitizer: Optional[SecretSanitizer] = None,
         quota_manager: Optional[QuotaBudgetManager] = None,
         evolution_manager: Optional[Any] = None,
+        image_limiter: Optional[ImageGenerationLimiter] = None,
     ) -> None:
         self.config_mgr = config_mgr
         bot_cfg = self.config_mgr.bot
@@ -169,11 +203,14 @@ class GroupBotOrchestrator:
         self.document_builder = document_builder or DocumentBuilder(
             temp_dir_base=bot_cfg.media.temp_dir if bot_cfg else "data/tmp",
         )
+        self._image_limiter = image_limiter or ImageGenerationLimiter(bot_cfg.image_generation)
         self.provider = provider or AntigravityProvider(build_antigravity_config(bot_cfg))
         self.quota_manager = quota_manager or QuotaBudgetManager(
             memory_store=self.memory_store,
             config=bot_cfg,
         )
+        if hasattr(self.provider, "set_quota_warning_callback"):
+            self.provider.set_quota_warning_callback(self.quota_manager.record_quota_warning)
         self.evolution_manager = evolution_manager or SelfEvolutionManager(
             config_mgr=self.config_mgr,
             memory_store=self.memory_store,
@@ -252,8 +289,17 @@ class GroupBotOrchestrator:
         self._debounce_tasks: Dict[int, asyncio.Task[Any]] = {}
         self._debounce_started_at: Dict[int, float] = {}
         self._chat_locks: Dict[int, asyncio.Lock] = {}
+        self._compaction_locks: Dict[int, asyncio.Lock] = {}
         self._recent_fact_usage: Dict[int, Dict[int, Tuple[int, float]]] = {}
         self._bot_reply_seq: Dict[int, int] = {}
+
+        default_ops_mode = str(
+            getattr(bot_cfg.antigravity, "ops_tools_default_mode", "on") or "on"
+        ).strip().lower()
+        self._ops_tools_mode: str = (
+            default_ops_mode if default_ops_mode in self._VALID_OPS_TOOLS_MODES else "on"
+        )
+        self._ops_tools_mode_loaded: bool = False
 
         self.chat_states: Dict[int, Dict[str, float]] = {}
         now = time.time()
@@ -286,11 +332,12 @@ class GroupBotOrchestrator:
             self.sanitizer.register_secret(api_hash)
 
     def _on_config_reloaded(self) -> None:
-        """Synchronize Telegram access lists and secret sanitizer on ConfigManager reload."""
+        """Synchronize Telegram access lists, image limiter, and secret sanitizer on ConfigManager reload."""
         bot_cfg = self.config_mgr.bot
         if bot_cfg is None:
             return
         self._register_config_secrets(bot_cfg)
+        self._image_limiter.update_config(bot_cfg.image_generation)
         resolved_token = resolve_bot_token_from_env_or_config(bot_cfg.telegram.bot_token)
         if resolved_token:
             self.sanitizer.register_secret(resolved_token)
@@ -340,10 +387,40 @@ class GroupBotOrchestrator:
             )
         )
 
-    def _is_provider_rate_limited(self) -> bool:
-        """Return True if the LLM provider has an active rate-limit/billing circuit breaker."""
+    def _is_provider_rate_limited(self, role: str = "group") -> bool:
+        """Return True only when all candidate models for ``role`` are rate-limited on the provider."""
         checker = getattr(self.provider, "is_rate_limited", None)
-        return callable(checker) and checker() is True
+        if not callable(checker):
+            return False
+
+        candidates: List[str] = []
+        qm = getattr(self, "quota_manager", None)
+        if qm is not None and hasattr(qm, "select_model"):
+            try:
+                primary_model, _ = qm.select_model(role)
+                if primary_model:
+                    candidates.append(primary_model)
+            except Exception:
+                pass
+
+        bot_cfg = self.config_mgr.bot if getattr(self, "config_mgr", None) is not None else None
+        models_cfg = getattr(bot_cfg, "models", None) if bot_cfg is not None else None
+        for fb in getattr(models_cfg, "fallback_models", []) or []:
+            fb_model = getattr(fb, "model", None)
+            if fb_model and fb_model not in candidates:
+                candidates.append(fb_model)
+
+        if not candidates:
+            return checker() is True
+
+        for candidate in candidates:
+            try:
+                limited = checker(model=candidate) is True
+            except TypeError:
+                return checker() is True
+            if not limited:
+                return False
+        return True
 
     def _provider_lacks_binary_media(
         self,
@@ -429,7 +506,7 @@ class GroupBotOrchestrator:
 
     async def _summarize_transcript_via_provider(self, transcript: str) -> List[Dict[str, str]]:
         """Extract genuinely durable facts from human conversation transcript using Antigravity."""
-        if self._is_provider_rate_limited():
+        if self._is_provider_rate_limited(role="compaction"):
             logger.info("Skipping compaction summarization while provider is rate-limited.")
             return []
         prompt = (
@@ -441,14 +518,49 @@ class GroupBotOrchestrator:
             '[{"subject": "...", "fact": "...", "category": "lore|event|agreement|friend_bio"}].\n\n'
             f"Переписка:\n{transcript}"
         )
+        chosen_model: Optional[str] = None
+        chosen_effort: Optional[str] = None
+        qm = getattr(self, "quota_manager", None)
+        if qm is not None and hasattr(qm, "select_model"):
+            try:
+                chosen_model, chosen_effort = qm.select_model("compaction")
+            except Exception:
+                chosen_model, chosen_effort = None, None
         try:
             try:
-                resp = await self.provider.generate_response(
-                    prompt=prompt,
-                    tool_profile="chat",
-                )
+                if chosen_model is not None:
+                    resp = await self.provider.generate_response(
+                        prompt=prompt,
+                        model=chosen_model,
+                        effort=chosen_effort,
+                        tool_profile="chat",
+                    )
+                else:
+                    resp = await self.provider.generate_response(
+                        prompt=prompt,
+                        tool_profile="chat",
+                    )
             except TypeError:
-                resp = await self.provider.generate_response(prompt=prompt)
+                try:
+                    resp = await self.provider.generate_response(
+                        prompt=prompt,
+                        tool_profile="chat",
+                    )
+                except TypeError:
+                    resp = await self.provider.generate_response(prompt=prompt)
+            usage = getattr(resp, "usage", None)
+            if usage is not None and qm is not None and hasattr(qm, "record_usage"):
+                try:
+                    model_name = getattr(resp, "model", None) or chosen_model or "unknown"
+                    rec = qm.record_usage(
+                        usage,
+                        model=model_name,
+                        source="compaction",
+                    )
+                    if inspect.isawaitable(rec):
+                        await rec
+                except Exception as rec_exc:
+                    logger.debug("Failed to record compaction usage: %s", rec_exc)
             text = resp.text if hasattr(resp, "text") else str(resp)
             return self.compaction_engine._parse_extracted_facts(text)
         except Exception as exc:
@@ -597,10 +709,53 @@ class GroupBotOrchestrator:
                 return attr
         return "media" if incoming.media else None
 
+    def _prune_chat_caches(self) -> None:
+        """Bound per-chat in-memory caches so long uptimes do not accumulate stale entries."""
+        cap = self._MAX_TRACKED_CHATS
+        bot_cfg = self.config_mgr.bot
+        protected_chats: Set[int] = set()
+        if bot_cfg is not None:
+            protected_chats.update(int(c) for c in (bot_cfg.telegram.allowed_chat_ids or []))
+            protected_chats.update(self._effective_dm_user_ids(bot_cfg))
+
+        for lock_map in (self._chat_locks, self._compaction_locks):
+            if len(lock_map) > cap:
+                for cid in list(lock_map.keys()):
+                    if len(lock_map) <= cap:
+                        break
+                    if cid not in protected_chats and not lock_map[cid].locked():
+                        lock_map.pop(cid, None)
+
+        if len(self.chat_states) > cap:
+            removable = [cid for cid in self.chat_states if cid not in protected_chats]
+            removable.sort(
+                key=lambda cid: float(self.chat_states[cid].get("last_chat_msg_time", 0.0))
+            )
+            for cid in removable:
+                if len(self.chat_states) <= cap:
+                    break
+                self.chat_states.pop(cid, None)
+
+        if len(self._recent_fact_usage) > cap:
+            for cid in list(self._recent_fact_usage.keys()):
+                if len(self._recent_fact_usage) <= cap:
+                    break
+                if cid not in protected_chats:
+                    self._recent_fact_usage.pop(cid, None)
+
+        if len(self._bot_reply_seq) > cap:
+            for cid in list(self._bot_reply_seq.keys()):
+                if len(self._bot_reply_seq) <= cap:
+                    break
+                if cid not in protected_chats:
+                    self._bot_reply_seq.pop(cid, None)
+
     def _get_recent_fact_ids(self, chat_id: int, now: float) -> List[int]:
         """Return active per-chat cooled-down fact IDs (within last N bot replies or 30m TTL)."""
         bucket = self._recent_fact_usage.get(chat_id)
         if not bucket:
+            if bucket is not None:
+                self._recent_fact_usage.pop(chat_id, None)
             return []
         cur_seq = self._bot_reply_seq.get(chat_id, 0)
         expired = [
@@ -611,18 +766,34 @@ class GroupBotOrchestrator:
         ]
         for fid in expired:
             bucket.pop(fid, None)
+        if not bucket:
+            self._recent_fact_usage.pop(chat_id, None)
+            return []
         return list(bucket.keys())
 
     def _record_used_facts(self, chat_id: int, facts: Sequence[FactRecord], now: float) -> None:
         """Advance per-chat reply sequence and record any injected fact IDs for cooldown."""
         seq = self._bot_reply_seq.get(chat_id, 0) + 1
         self._bot_reply_seq[chat_id] = seq
-        if not facts:
-            return
-        bucket = self._recent_fact_usage.setdefault(chat_id, {})
-        for fact in facts:
-            if getattr(fact, "id", None) is not None:
-                bucket[int(fact.id)] = (seq, now)
+        existing = self._recent_fact_usage.get(chat_id)
+        if existing:
+            for fid, (old_seq, old_ts) in list(existing.items()):
+                if (seq - old_seq) >= self._FACT_COOLDOWN_REPLIES or (
+                    now - old_ts
+                ) >= self._FACT_COOLDOWN_SECONDS:
+                    existing.pop(fid, None)
+            if not existing:
+                self._recent_fact_usage.pop(chat_id, None)
+        if facts:
+            bucket = self._recent_fact_usage.setdefault(chat_id, {})
+            for fact in facts:
+                if getattr(fact, "id", None) is not None:
+                    bucket[int(fact.id)] = (seq, now)
+        if (
+            len(self._recent_fact_usage) > self._MAX_TRACKED_CHATS
+            or len(self._bot_reply_seq) > self._MAX_TRACKED_CHATS
+        ):
+            self._prune_chat_caches()
 
     @staticmethod
     def _filter_overused_facts(
@@ -673,6 +844,7 @@ class GroupBotOrchestrator:
         include_tool_instructions: Optional[bool] = None,
         media_from_reply: bool = False,
         voice_reply_mode: bool = False,
+        ops_tools_enabled: bool = False,
     ) -> str:
         """Assemble concise contextual prompt with passive memory, history, and gated tool specs."""
         sections: List[str] = []
@@ -805,11 +977,33 @@ class GroupBotOrchestrator:
                 '"table":[["A","B"],["1","2"]]}],"sources":["https://..."]}] '
                 "(можно с короткой живой репликой перед тегом)."
             )
+        bot_cfg = self.config_mgr.bot
+        img_cfg = bot_cfg.image_generation if bot_cfg is not None else None
+        if (
+            img_cfg is not None
+            and img_cfg.enabled
+            and img_cfg.allow_natural_language_trigger
+            and IMAGE_INTENT_RE.search(raw_for_tools)
+        ):
+            guidance += (
+                "\nГЕНЕРАЦИЯ КАРТИНОК: ты УМЕЕШЬ рисовать и отправлять картинки прямо в чат "
+                "(используй ТОЛЬКО если пользователь действительно просит нарисовать/сгенерировать изображение "
+                "и запрос не нарушает запреты). Для генерации добавь в конец ровно один тег "
+                '[IMG:{"prompt":"detailed English or Russian image description","caption":"optional short Russian caption","aspect_ratio":"1:1"}] '
+                "(допустимые aspect_ratio: 1:1, 16:9, 9:16, 4:3, 3:4, 3:2, 2:3, 21:9; "
+                "можно добавить короткую живую реплику перед тегом)."
+            )
         if voice_reply_mode:
             guidance += (
                 "\nГОЛОСОВОЙ ОТВЕТ: собеседник отправил голосовое сообщение, твой ответ будет озвучен голосом (TTS). "
                 "Отвечай максимально естественно, живо и разговорно (1-2 коротких предложения), "
                 "БЕЗ Markdown-разметки, БЕЗ таблиц, списков, блоков кода и URL-ссылок."
+            )
+        if ops_tools_enabled:
+            guidance += (
+                "\nРАСШИРЕННЫЙ РЕЖИМ ИНСТРУМЕНТОВ (ops, без root): доступны команды, файлы, поиск, "
+                "субагенты и /evolve /quota /backup — используй ТОЛЬКО если просьба этого требует; "
+                "секреты (.env, токены, пароли) не раскрывай."
             )
         sections.append(guidance)
         return "\n\n".join(sections)
@@ -834,7 +1028,10 @@ class GroupBotOrchestrator:
 
     @staticmethod
     def _extract_sent_message_id(sent_res: Any) -> int:
-        """Extract integer Telegram message_id from Bot API dict or Telethon Message object."""
+        """Extract integer Telegram message_id from int, Bot API dict, or Telethon Message object."""
+        if isinstance(sent_res, int) and not isinstance(sent_res, bool):
+            return sent_res if sent_res > 0 else (int(time.time() * 1000) + 1)
+
         candidate: Any = None
         if isinstance(sent_res, dict):
             res_obj = sent_res.get("result")
@@ -859,7 +1056,19 @@ class GroupBotOrchestrator:
             return
 
         chat_id = incoming.chat_id
+        if (
+            chat_id not in self._debounce_buffers
+            and len(self._debounce_buffers) >= self._MAX_TRACKED_CHATS
+        ):
+            for stale_cid in list(self._debounce_tasks.keys()):
+                stale_task = self._debounce_tasks.get(stale_cid)
+                if stale_task is None or stale_task.done():
+                    self._debounce_tasks.pop(stale_cid, None)
+                    self._debounce_buffers.pop(stale_cid, None)
+                    self._debounce_started_at.pop(stale_cid, None)
         buf = self._debounce_buffers.setdefault(chat_id, [])
+        if len(buf) >= self._MAX_DEBOUNCE_BUFFER:
+            del buf[: len(buf) - self._MAX_DEBOUNCE_BUFFER + 1]
         buf.append(incoming)
         first_ts = self._debounce_started_at.setdefault(chat_id, time.monotonic())
 
@@ -882,6 +1091,29 @@ class GroupBotOrchestrator:
             await self._process_buffered_messages(chat_id)
         except asyncio.CancelledError:
             return
+        except AntigravityNativeToolAbort as exc:
+            if not getattr(exc, "_native_tool_abort_logged", False):
+                logger.warning(
+                    "Native tool execution aborted while flushing chat %s: %s",
+                    chat_id,
+                    self.sanitizer.sanitize(str(exc)),
+                )
+            else:
+                logger.debug(
+                    "Native tool execution abort handled during flush for chat %s.",
+                    chat_id,
+                )
+            bot_cfg = self.config_mgr.bot
+            admin_ids = (
+                {int(uid) for uid in (getattr(bot_cfg.telegram, "admin_user_ids", []) or [])}
+                if bot_cfg is not None
+                else set()
+            )
+            if int(chat_id) > 0 and int(chat_id) in admin_ids:
+                await self._send_native_tool_abort_notice(
+                    chat_id=chat_id,
+                    tool_profile=self._extract_abort_profile(exc),
+                )
         except Exception as exc:
             logger.exception("Error flushing debounced messages for chat %s: %s", chat_id, exc)
 
@@ -889,7 +1121,14 @@ class GroupBotOrchestrator:
         """Pop and process all buffered incoming messages for a chat as one coalesced turn."""
         messages = self._debounce_buffers.pop(chat_id, [])
         self._debounce_started_at.pop(chat_id, None)
-        self._debounce_tasks.pop(chat_id, None)
+        current_task = asyncio.current_task()
+        if self._debounce_tasks.get(chat_id) is current_task or current_task is None:
+            self._debounce_tasks.pop(chat_id, None)
+        elif (
+            chat_id in self._debounce_tasks
+            and self._debounce_tasks[chat_id].done()
+        ):
+            self._debounce_tasks.pop(chat_id, None)
         if not messages:
             return None
         return await self._process_coalesced_messages(messages)
@@ -1121,9 +1360,22 @@ class GroupBotOrchestrator:
             return None
 
         self._sync_voice_configs(bot_cfg)
+        await self._ensure_ops_tools_mode_loaded()
+
+        working_messages = list(messages)
+        if not self._is_batch_permitted(working_messages, bot_cfg):
+            await self._save_incoming_batch(working_messages, now=time.time())
+            return None
+
+        if (
+            len(self._chat_locks) > self._MAX_TRACKED_CHATS
+            or len(self.chat_states) > self._MAX_TRACKED_CHATS
+        ):
+            self._prune_chat_caches()
 
         chat_id = messages[-1].chat_id
         lock = self._chat_locks.setdefault(chat_id, asyncio.Lock())
+        reply_result: Optional[str] = None
         async with lock:
             now = time.time()
             state = self.chat_states.setdefault(
@@ -1135,16 +1387,11 @@ class GroupBotOrchestrator:
             in_quiet = self.proactive_engine.is_in_quiet_hours()
             time_since_bot = now - state.get("last_bot_msg_time", 0.0)
 
-            working_messages = list(messages)
             media_candidates = [m for m in working_messages if self._has_incoming_media(m)]
             media_target = media_candidates[-1] if media_candidates else None
             voice_candidates = [m for m in working_messages if self._is_voice_message(m)]
 
             if voice_candidates and bot_cfg.voice.stt.enabled:
-                if not self._is_batch_permitted(working_messages, bot_cfg):
-                    await self._save_incoming_batch(working_messages, now=now)
-                    return None
-
                 voice_target = (
                     media_target
                     if media_target is not None and self._is_voice_message(media_target)
@@ -1209,7 +1456,7 @@ class GroupBotOrchestrator:
                         )
                         else media_text
                     )
-                    return await self._complete_reply_turn(
+                    reply_result = await self._complete_reply_turn(
                         chat_id=chat_id,
                         bot_cfg=bot_cfg,
                         state=state,
@@ -1226,160 +1473,621 @@ class GroupBotOrchestrator:
                         attachments=attachments,
                         is_voice_target=is_voice_target,
                     )
-
-            # Standard non-voice path: evaluate heuristics BEFORE downloading/transcoding any media
-            decision, primary = self._evaluate_batch_heuristics(
-                messages=working_messages,
-                bot_cfg=bot_cfg,
-                time_since_bot=time_since_bot,
-                in_quiet=in_quiet,
-                now=now,
-            )
-
-            if (
-                decision == ReplyAction.SPONTANEOUS_REPLY
-                and not self.quota_manager.should_allow_spontaneous()
-            ):
-                decision = ReplyAction.IGNORE
-
-            if decision == ReplyAction.IGNORE:
-                await self._save_incoming_batch(working_messages, now=now)
-                return None
-
-            combined_text = "\n".join(
-                (m.text or "").strip() for m in working_messages if (m.text or "").strip()
-            ).strip()
-
-            # Admin DM slash commands (/quota, /evolve)
-            turn_profile, _, _ = self._resolve_turn_tool_profile(
-                chat_id=chat_id,
-                bot_cfg=bot_cfg,
-                primary=primary,
-                messages=working_messages,
-            )
-            if turn_profile == "ops" and combined_text:
-                cmd_text = combined_text.strip()
-                if cmd_text == "/quota" or cmd_text.startswith(("/quota ", "/quota@")):
-                    await asyncio.to_thread(self.quota_manager.sync_live_quota)
-                    report = self.sanitizer.sanitize(self.quota_manager.format_quota_report())
-                    await self.userbot.send_reply(
-                        chat_id=chat_id,
-                        text=report,
-                        reply_to_msg_id=primary.msg_id if primary.msg_id else None,
-                    )
-                    return report
-                if cmd_text == "/backup" or cmd_text.startswith(("/backup ", "/backup@")):
-                    res = await self._run_memory_backup_once()
-                    if res is None:
-                        msg = "Бэкап не выполнен: файл базы памяти ещё не создан."
-                    else:
-                        msg = (
-                            f"Бэкап памяти создан: `{res.backup_path.name}` "
-                            f"({res.size_bytes / 1024:.1f} KiB, удалено старых: {res.pruned_count})."
-                        )
-                    msg = self.sanitizer.sanitize(msg)
-                    await self.userbot.send_reply(
-                        chat_id=chat_id,
-                        text=msg,
-                        reply_to_msg_id=primary.msg_id if primary.msg_id else None,
-                    )
-                    return msg
-                if (cmd_text.startswith("/evolve ") or cmd_text.startswith("/self_edit ")) and self.evolution_manager is not None:
-                    task_body = cmd_text.split(" ", 1)[1].strip()
-                    if task_body:
-                        evo_res = await self.evolution_manager.run_admin_task(
-                            user_id=primary.sender_id,
-                            task=task_body,
-                        )
-                        return str(evo_res)
-
-            reply_media_raw: Any = None
-            is_reply_media = False
-            if media_target is None:
-                for m in reversed(working_messages):
-                    r_media = getattr(m, "reply_to_media_event", None) or getattr(
-                        getattr(m, "raw_event", None), "reply_to_media_event", None
-                    )
-                    if r_media is not None:
-                        reply_media_raw = getattr(r_media, "message", r_media)
-                        if isinstance(reply_media_raw, str):
-                            reply_media_raw = r_media
-                        is_reply_media = True
-                        break
-
-            # Skip blind media-only non-direct messages when provider cannot see images
-            if (
-                media_target is not None
-                and not combined_text
-                and decision != ReplyAction.MUST_REPLY
-            ):
-                await self._save_incoming_batch(working_messages, now=now)
-                return None
-
-            if media_target is not None:
-                raw_msg = getattr(media_target.raw_event, "message", media_target.raw_event)
-                if isinstance(raw_msg, str):
-                    raw_msg = media_target.raw_event
-            elif reply_media_raw is not None:
-                raw_msg = reply_media_raw
             else:
-                raw_msg = getattr(primary.raw_event, "message", primary.raw_event)
-                if isinstance(raw_msg, str):
-                    raw_msg = primary.raw_event
-            async with self.media_processor.managed_media(raw_msg, client=self.userbot.client) as processed:
-                media_summary = self.summarize_processed_media(processed)
-                media_type = processed.media_type if processed else None
-                media_text = processed.text_content if processed else None
-                attachments = self.build_media_attachments(processed)
+                # Explicit /imagine and /img commands: intercept AFTER permission check and BEFORE heuristics
+                # so bare `/imagine <prompt>` works in groups without hitting quiet-hours / spontaneous probability.
+                imagine_match = self._find_imagine_command(working_messages)
+                if imagine_match is not None:
+                    cmd_msg, cmd_res = imagine_match
+                    if cmd_res.addressed_to_other_bot:
+                        await self._save_incoming_batch(working_messages, now=now)
+                        return None
+                    if cmd_res.is_command:
+                        return await self._handle_imagine_command(
+                            chat_id=chat_id,
+                            bot_cfg=bot_cfg,
+                            state=state,
+                            now=now,
+                            cmd_msg=cmd_msg,
+                            cmd_res=cmd_res,
+                            messages=working_messages,
+                        )
 
-                await self._save_incoming_batch(
-                    working_messages,
-                    now=now,
-                    media_target_id=(
-                        id(media_target)
-                        if (media_target is not None and not is_reply_media)
-                        else None
-                    ),
-                    media_type=media_type if not is_reply_media else None,
-                    media_summary=media_summary if not is_reply_media else None,
-                )
+                # Explicit /ops, /tools, /safemode toggle commands: intercept BEFORE heuristics
+                ops_mode_match = self._find_ops_mode_command(working_messages)
+                if ops_mode_match is not None:
+                    cmd_msg, action, addressed_to_other_bot = ops_mode_match
+                    if addressed_to_other_bot:
+                        await self._save_incoming_batch(working_messages, now=now)
+                        return None
+                    return await self._handle_ops_mode_command(
+                        chat_id=chat_id,
+                        bot_cfg=bot_cfg,
+                        now=now,
+                        cmd_msg=cmd_msg,
+                        action=action,
+                        messages=working_messages,
+                    )
 
-                is_voice_target = self._is_voice_message(primary) or (
-                    media_target is not None
-                    and not is_reply_media
-                    and media_target.sender_id == primary.sender_id
-                    and self._is_voice_message(media_target)
-                )
-                return await self._complete_reply_turn(
-                    chat_id=chat_id,
-                    bot_cfg=bot_cfg,
-                    state=state,
-                    now=now,
-                    decision=decision,
-                    primary=primary,
+                # Explicit /quota, /backup, /evolve, /self_edit commands: intercept BEFORE heuristics
+                ops_action_match = self._find_ops_action_command(working_messages)
+                if ops_action_match is not None:
+                    cmd_msg, cmd_name, cmd_arg, addressed_to_other_bot = ops_action_match
+                    if addressed_to_other_bot:
+                        await self._save_incoming_batch(working_messages, now=now)
+                        return None
+                    handled, action_reply = await self._handle_ops_action_command(
+                        chat_id=chat_id,
+                        bot_cfg=bot_cfg,
+                        now=now,
+                        cmd_msg=cmd_msg,
+                        cmd_name=cmd_name,
+                        cmd_arg=cmd_arg,
+                        messages=working_messages,
+                    )
+                    if handled:
+                        return action_reply
+
+                # Standard non-voice path: evaluate heuristics BEFORE downloading/transcoding any media
+                decision, primary = self._evaluate_batch_heuristics(
                     messages=working_messages,
-                    combined_text=combined_text,
-                    media_target=media_target,
-                    is_reply_media=is_reply_media,
-                    media_summary=media_summary,
-                    media_text=media_text,
-                    raw_media_text=media_text,
-                    attachments=attachments,
-                    is_voice_target=is_voice_target,
+                    bot_cfg=bot_cfg,
+                    time_since_bot=time_since_bot,
+                    in_quiet=in_quiet,
+                    now=now,
                 )
+
+                if (
+                    decision == ReplyAction.SPONTANEOUS_REPLY
+                    and not self.quota_manager.should_allow_spontaneous()
+                ):
+                    decision = ReplyAction.IGNORE
+
+                if decision == ReplyAction.IGNORE:
+                    await self._save_incoming_batch(working_messages, now=now)
+                    return None
+
+                combined_text = "\n".join(
+                    (m.text or "").strip() for m in working_messages if (m.text or "").strip()
+                ).strip()
+
+                reply_media_raw: Any = None
+                is_reply_media = False
+                if media_target is None:
+                    for m in reversed(working_messages):
+                        r_media = getattr(m, "reply_to_media_event", None) or getattr(
+                            getattr(m, "raw_event", None), "reply_to_media_event", None
+                        )
+                        if r_media is not None:
+                            reply_media_raw = getattr(r_media, "message", r_media)
+                            if isinstance(reply_media_raw, str):
+                                reply_media_raw = r_media
+                            is_reply_media = True
+                            break
+
+                # Skip blind media-only non-direct messages when provider cannot see images
+                if (
+                    media_target is not None
+                    and not combined_text
+                    and decision != ReplyAction.MUST_REPLY
+                ):
+                    await self._save_incoming_batch(working_messages, now=now)
+                    return None
+
+                if media_target is not None:
+                    raw_msg = getattr(media_target.raw_event, "message", media_target.raw_event)
+                    if isinstance(raw_msg, str):
+                        raw_msg = media_target.raw_event
+                elif reply_media_raw is not None:
+                    raw_msg = reply_media_raw
+                else:
+                    raw_msg = getattr(primary.raw_event, "message", primary.raw_event)
+                    if isinstance(raw_msg, str):
+                        raw_msg = primary.raw_event
+                async with self.media_processor.managed_media(raw_msg, client=self.userbot.client) as processed:
+                    media_summary = self.summarize_processed_media(processed)
+                    media_type = processed.media_type if processed else None
+                    media_text = processed.text_content if processed else None
+                    attachments = self.build_media_attachments(processed)
+
+                    await self._save_incoming_batch(
+                        working_messages,
+                        now=now,
+                        media_target_id=(
+                            id(media_target)
+                            if (media_target is not None and not is_reply_media)
+                            else None
+                        ),
+                        media_type=media_type if not is_reply_media else None,
+                        media_summary=media_summary if not is_reply_media else None,
+                    )
+
+                    is_voice_target = self._is_voice_message(primary) or (
+                        media_target is not None
+                        and not is_reply_media
+                        and media_target.sender_id == primary.sender_id
+                        and self._is_voice_message(media_target)
+                    )
+                    reply_result = await self._complete_reply_turn(
+                        chat_id=chat_id,
+                        bot_cfg=bot_cfg,
+                        state=state,
+                        now=now,
+                        decision=decision,
+                        primary=primary,
+                        messages=working_messages,
+                        combined_text=combined_text,
+                        media_target=media_target,
+                        is_reply_media=is_reply_media,
+                        media_summary=media_summary,
+                        media_text=media_text,
+                        raw_media_text=media_text,
+                        attachments=attachments,
+                        is_voice_target=is_voice_target,
+                    )
+
+        if reply_result:
+            await self._maybe_run_compaction(chat_id)
+        return reply_result
+
+    async def _maybe_run_compaction(self, chat_id: int) -> None:
+        """Run chat history compaction OUTSIDE `_chat_locks` so LLM summarization never blocks replies."""
+        if self._is_provider_rate_limited(role="compaction"):
+            return
+        comp_lock = self._compaction_locks.setdefault(chat_id, asyncio.Lock())
+        if comp_lock.locked():
+            return
+        async with comp_lock:
+            if self._is_provider_rate_limited(role="compaction"):
+                return
+            bot_uid = getattr(self.userbot, "bot_id", None)
+            excluded_uids = [int(bot_uid)] if bot_uid else None
+            await self.compaction_engine.run_compaction_for_chat(
+                chat_id,
+                excluded_user_ids=excluded_uids,
+            )
+
+    def _find_imagine_command(
+        self,
+        messages: Sequence[IncomingMessage],
+    ) -> Optional[Tuple[IncomingMessage, ImageCommandParseResult]]:
+        """Return `(msg, parse_result)` if any message in the batch is a `/imagine` or `/img` command."""
+        bot_username = getattr(self.userbot, "bot_username", None)
+        for msg in reversed(messages):
+            candidate_text = msg.text or getattr(msg.raw_event, "caption", None) or ""
+            if not candidate_text.strip().startswith("/"):
+                continue
+            parsed = parse_imagine_command(candidate_text, bot_username=bot_username)
+            if parsed.is_command or parsed.addressed_to_other_bot:
+                return msg, parsed
+        return None
+
+    async def _extract_image_attachments_from_raw(
+        self,
+        raw_msg: Any,
+    ) -> Tuple[List[MediaAttachment], Optional[str], Optional[str]]:
+        """Download and buffer image attachments from a raw Telegram message for image-to-image."""
+        if raw_msg is None:
+            return [], None, None
+        try:
+            async with self.media_processor.managed_media(
+                raw_msg, client=self.userbot.client
+            ) as processed:
+                summary = self.summarize_processed_media(processed)
+                m_type = processed.media_type if processed else None
+                raw_atts = self.build_media_attachments(processed)
+                buffered: List[MediaAttachment] = []
+                for att in raw_atts:
+                    if not (att.mime_type or "").lower().startswith("image/"):
+                        continue
+                    raw_bytes = att.get_bytes()
+                    if raw_bytes:
+                        buffered.append(
+                            MediaAttachment(
+                                data=raw_bytes,
+                                mime_type=att.mime_type,
+                                description=att.description,
+                                file_name=att.file_name,
+                            )
+                        )
+                return buffered, m_type, summary
+        except Exception as exc:
+            logger.warning("Failed to prepare reference image attachment: %s", exc)
+            return [], None, None
+
+    async def _keep_chat_action_alive(
+        self,
+        chat_id: int,
+        action: str = "upload-photo",
+        interval_seconds: float = 4.5,
+    ) -> None:
+        """Periodically refresh a Telegram chat action while image generation is in flight."""
+        if not hasattr(self.userbot, "send_typing_action"):
+            return
+        while True:
+            await asyncio.sleep(interval_seconds)
+            try:
+                try:
+                    await self.userbot.send_typing_action(chat_id, action=action)
+                except TypeError:
+                    await self.userbot.send_typing_action(chat_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("Chat action keepalive (%s) failed: %s", action, exc)
 
     @staticmethod
-    def _resolve_turn_tool_profile(
+    def _build_image_usage_info(usage: Any) -> Optional[UsageInfo]:
+        """Convert GeneratedImageResult.usage dict or UsageInfo into UsageInfo for QuotaBudgetManager."""
+        if usage is None:
+            return None
+        if isinstance(usage, UsageInfo):
+            return usage
+        if isinstance(usage, dict) and usage:
+            try:
+                return UsageInfo.model_validate(usage)
+            except Exception:
+                numeric_fields = {
+                    k: int(v)
+                    for k, v in usage.items()
+                    if k in UsageInfo.model_fields
+                    and isinstance(v, (int, float))
+                    and not isinstance(v, bool)
+                }
+                if numeric_fields:
+                    return UsageInfo(**numeric_fields)
+        return None
+
+    async def _handle_imagine_command(
+        self,
+        *,
+        chat_id: int,
+        bot_cfg: BotConfig,
+        state: Dict[str, float],
+        now: float,
+        cmd_msg: IncomingMessage,
+        cmd_res: ImageCommandParseResult,
+        messages: List[IncomingMessage],
+    ) -> Optional[str]:
+        """Handle explicit `/imagine` and `/img` commands in allowed groups and DMs."""
+        reply_to_id = cmd_msg.msg_id if cmd_msg.msg_id else None
+        img_cfg = bot_cfg.image_generation
+
+        if not img_cfg.enabled:
+            await self._save_incoming_batch(messages, now=now)
+            disabled_msg = "Генерация картинок сейчас отключена."
+            await self.send_sanitized_message(
+                chat_id=chat_id,
+                text=disabled_msg,
+                reply_to_msg_id=reply_to_id,
+            )
+            return disabled_msg
+
+        prompt_text = (cmd_res.prompt or "").strip()
+        reply_text = (
+            getattr(cmd_msg, "reply_to_text", None)
+            or getattr(cmd_msg.raw_event, "reply_to_text", None)
+            or ""
+        ).strip()
+        if not prompt_text and reply_text:
+            prompt_text = reply_text
+        elif prompt_text and reply_text:
+            prompt_text = f"{prompt_text}\nКонтекст сообщения: {reply_text[:400]}"
+
+        if not prompt_text:
+            await self._save_incoming_batch(messages, now=now)
+            usage_hint = (
+                "Напиши, что нарисовать: /imagine <описание> [--ar 16:9] "
+                "(или ответь командой на сообщение/фото)."
+            )
+            await self.send_sanitized_message(
+                chat_id=chat_id,
+                text=usage_hint,
+                reply_to_msg_id=reply_to_id,
+            )
+            return usage_hint
+
+        # Optional reference image from command photo caption or replied-to photo/static sticker
+        reference_images: List[MediaAttachment] = []
+        saved_media_target_id: Optional[int] = None
+        saved_media_type: Optional[str] = None
+        saved_media_summary: Optional[str] = None
+
+        if self._has_incoming_media(cmd_msg):
+            raw_cmd_msg = getattr(cmd_msg.raw_event, "message", cmd_msg.raw_event)
+            if isinstance(raw_cmd_msg, str):
+                raw_cmd_msg = cmd_msg.raw_event
+            reference_images, saved_media_type, saved_media_summary = (
+                await self._extract_image_attachments_from_raw(raw_cmd_msg)
+            )
+            saved_media_target_id = id(cmd_msg)
+        else:
+            r_media = getattr(cmd_msg, "reply_to_media_event", None) or getattr(
+                getattr(cmd_msg, "raw_event", None), "reply_to_media_event", None
+            )
+            if r_media is not None:
+                raw_reply_media = getattr(r_media, "message", r_media)
+                if isinstance(raw_reply_media, str):
+                    raw_reply_media = r_media
+                reference_images, _, _ = await self._extract_image_attachments_from_raw(
+                    raw_reply_media
+                )
+
+        await self._save_incoming_batch(
+            messages,
+            now=now,
+            media_target_id=saved_media_target_id,
+            media_type=saved_media_type,
+            media_summary=saved_media_summary,
+        )
+
+        return await self._execute_image_generation(
+            chat_id=chat_id,
+            user_id=cmd_msg.sender_id,
+            bot_cfg=bot_cfg,
+            state=state,
+            prompt=prompt_text,
+            caption=None,
+            aspect_ratio=cmd_res.aspect_ratio,
+            reference_images=reference_images or None,
+            reply_to_msg_id=reply_to_id,
+            decision=ReplyAction.MUST_REPLY,
+        )
+
+    async def _execute_image_generation(
+        self,
+        *,
+        chat_id: int,
+        user_id: int,
+        bot_cfg: BotConfig,
+        state: Dict[str, float],
+        prompt: str,
+        caption: Optional[str] = None,
+        aspect_ratio: Optional[str] = None,
+        reference_images: Optional[List[MediaAttachment]] = None,
+        reply_to_msg_id: Optional[int] = None,
+        decision: ReplyAction = ReplyAction.MUST_REPLY,
+        send_error_reply: bool = True,
+    ) -> Optional[str]:
+        """Unified image generation pipeline: rate limit, chat action, provider call, delivery & memory."""
+        img_cfg = bot_cfg.image_generation
+        clean_prompt = (prompt or "").strip()[: int(img_cfg.max_prompt_chars)].strip()
+        if not clean_prompt:
+            return None
+
+        admin_ids = {int(uid) for uid in (getattr(bot_cfg.telegram, "admin_user_ids", []) or [])}
+        is_admin = int(user_id) in admin_ids
+
+        try:
+            reservation_token = self._image_limiter.check_and_reserve(
+                user_id=user_id,
+                chat_id=chat_id,
+                is_admin=is_admin,
+            )
+        except ImageRateLimitError as exc:
+            safe_notice = self.sanitizer.sanitize(exc.user_message)
+            if send_error_reply:
+                await self.send_sanitized_message(
+                    chat_id=chat_id,
+                    text=safe_notice,
+                    reply_to_msg_id=reply_to_msg_id,
+                )
+            return safe_notice
+
+        generate_fn = getattr(self.provider, "generate_image", None)
+        if not callable(generate_fn):
+            self._image_limiter.refund(user_id, chat_id, reservation_token)
+            unavail_msg = "Генерация картинок сейчас недоступна для текущего провайдера."
+            if send_error_reply:
+                await self.send_sanitized_message(
+                    chat_id=chat_id,
+                    text=unavail_msg,
+                    reply_to_msg_id=reply_to_msg_id,
+                )
+            return unavail_msg
+
+        # Signal upload_photo immediately and keep it refreshed during generation
+        if hasattr(self.userbot, "send_typing_action"):
+            try:
+                try:
+                    await self.userbot.send_typing_action(chat_id, action="upload-photo")
+                except TypeError:
+                    await self.userbot.send_typing_action(chat_id)
+            except Exception as exc:
+                logger.debug("Initial upload-photo chat action failed: %s", exc)
+
+        keepalive_task = asyncio.create_task(
+            self._keep_chat_action_alive(chat_id, action="upload-photo", interval_seconds=4.5)
+        )
+        try:
+            result = await generate_fn(
+                clean_prompt,
+                aspect_ratio=aspect_ratio,
+                reference_images=reference_images,
+                model=img_cfg.model,
+                timeout_seconds=img_cfg.timeout_seconds,
+                output_dir=img_cfg.output_dir,
+                max_image_size_mb=img_cfg.max_image_size_mb,
+                cleanup_artifacts=img_cfg.cleanup_after_send,
+            )
+            if not isinstance(result, GeneratedImageResult) or not result.image_bytes:
+                raise ImageValidationError("Image provider returned an empty or invalid image result.")
+        except ImagePolicyRefusalError as exc:
+            # Do not refund on policy refusals to prevent repeated policy-probing bypasses.
+            logger.info("Image generation refused by policy in chat %s: %s", chat_id, exc)
+            refusal_msg = "Не могу это нарисовать — сработало ограничение контента."
+            if send_error_reply:
+                await self.send_sanitized_message(
+                    chat_id=chat_id,
+                    text=refusal_msg,
+                    reply_to_msg_id=reply_to_msg_id,
+                )
+            return refusal_msg
+        except ImageTimeoutError as exc:
+            self._image_limiter.refund(user_id, chat_id, reservation_token)
+            logger.warning("Image generation timed out in chat %s: %s", chat_id, exc)
+            timeout_msg = "Не успела дорисовать картинку — время ожидания вышло. Попробуй ещё раз чуть позже."
+            if send_error_reply:
+                await self.send_sanitized_message(
+                    chat_id=chat_id,
+                    text=timeout_msg,
+                    reply_to_msg_id=reply_to_msg_id,
+                )
+            return timeout_msg
+        except (ImageValidationError, ImageGenerationError, Exception) as exc:
+            self._image_limiter.refund(user_id, chat_id, reservation_token)
+            verdict = getattr(exc, "verdict", None) or classify_error(exc)
+            logger.warning("Image generation failed in chat %s: %s", chat_id, exc)
+            if verdict.category in (ErrorCategory.RATE_LIMIT, ErrorCategory.BILLING):
+                err_msg = "Лимит генерации картинок временно исчерпан, попробуй чуть позже."
+            else:
+                err_msg = "Не получилось сгенерировать картинку, попробуй ещё раз чуть позже."
+            if send_error_reply:
+                await self.send_sanitized_message(
+                    chat_id=chat_id,
+                    text=err_msg,
+                    reply_to_msg_id=reply_to_msg_id,
+                )
+            return err_msg
+        finally:
+            keepalive_task.cancel()
+            try:
+                await keepalive_task
+            except asyncio.CancelledError:
+                pass
+
+        # Record LLM/image token usage immediately after generation succeeds, BEFORE Telegram
+        # upload so spent tokens are tracked even if network delivery fails.
+        usage_info = self._build_image_usage_info(result.usage)
+        if usage_info is not None and self.quota_manager is not None:
+            try:
+                await self.quota_manager.record_usage(
+                    usage_info,
+                    model=result.model_used or img_cfg.model or bot_cfg.antigravity.model,
+                    source="image_gen",
+                )
+            except Exception as exc:
+                logger.debug("Failed recording image generation usage: %s", exc)
+
+        raw_caption = (caption or "").strip() or (result.caption_suggestion or "").strip()
+        safe_caption: Optional[str] = None
+        if raw_caption:
+            sanitized_cap = self.sanitizer.sanitize(raw_caption).strip()
+            if len(sanitized_cap) > 1024:
+                sanitized_cap = sanitized_cap[:1021].rstrip() + "..."
+            safe_caption = sanitized_cap or None
+
+        send_as_doc = should_send_as_document(
+            len(result.image_bytes),
+            result.width,
+            result.height,
+            threshold_mb=img_cfg.send_as_document_threshold_mb,
+        ) or not hasattr(self.userbot, "send_photo")
+
+        try:
+            if send_as_doc:
+                sent_res = await self.userbot.send_document(
+                    chat_id,
+                    result.image_bytes,
+                    filename=result.filename,
+                    caption=safe_caption,
+                    mime_type=result.mime_type,
+                    reply_to_message_id=reply_to_msg_id,
+                    simulate_typing=False,
+                )
+                saved_media_type = "document"
+            else:
+                sent_res = await self.userbot.send_photo(
+                    chat_id,
+                    result.image_bytes,
+                    caption=safe_caption,
+                    filename=result.filename,
+                    mime_type=result.mime_type,
+                    reply_to_message_id=reply_to_msg_id,
+                )
+                saved_media_type = "photo"
+        except Exception as exc:
+            self._image_limiter.refund(user_id, chat_id, reservation_token)
+            logger.warning("Failed delivering generated image to chat %s: %s", chat_id, exc)
+            delivery_err = "Картинка сгенерировалась, но не удалось отправить её в Telegram. Попробуй чуть позже."
+            if send_error_reply:
+                await self.send_sanitized_message(
+                    chat_id=chat_id,
+                    text=delivery_err,
+                    reply_to_msg_id=reply_to_msg_id,
+                )
+            return delivery_err
+
+        sent_ts = time.time()
+        state["last_bot_msg_time"] = sent_ts
+        if decision != ReplyAction.SPONTANEOUS_REPLY:
+            self.heuristics.record_reply(chat_id, timestamp=sent_ts)
+
+        safe_prompt = self.sanitizer.sanitize(result.prompt_used or clean_prompt).strip()
+        media_summary = f"Сгенерированное изображение: {safe_prompt[:220]}"
+        history_text = safe_caption or f"[Изображение: {safe_prompt[:180]}]"
+        sent_msg_id = self._extract_sent_message_id(sent_res)
+        bot_name = bot_cfg.behavior.bot_names[0] if bot_cfg.behavior.bot_names else "Джефф"
+
+        await self.memory_store.save_message(
+            ChatMessage(
+                telegram_msg_id=sent_msg_id,
+                chat_id=chat_id,
+                user_id=self.userbot.bot_id or 1,
+                timestamp=int(sent_ts),
+                author_name=bot_name,
+                text=history_text,
+                reply_to_msg_id=reply_to_msg_id,
+                media_type=saved_media_type,
+                media_summary=media_summary,
+            )
+        )
+        return history_text
+
+    async def _ensure_ops_tools_mode_loaded(self) -> str:
+        """Load persisted ops_tools_mode from SQLite once on startup or first message."""
+        if self._ops_tools_mode_loaded:
+            return self._ops_tools_mode
+        self._ops_tools_mode_loaded = True
+        getter = getattr(self.memory_store, "get_setting", None)
+        if callable(getter):
+            try:
+                saved = await getter(self._OPS_MODE_SETTING_KEY)
+                if isinstance(saved, str):
+                    norm = saved.strip().lower()
+                    if norm in self._VALID_OPS_TOOLS_MODES:
+                        self._ops_tools_mode = norm
+            except Exception as exc:
+                logger.warning("Failed to load persisted %s: %s", self._OPS_MODE_SETTING_KEY, exc)
+        return self._ops_tools_mode
+
+    @staticmethod
+    def _is_admin_sender(msg: IncomingMessage, bot_cfg: BotConfig) -> bool:
+        """Return True if msg was sent by a non-bot configured administrator."""
+        admin_ids = {int(uid) for uid in (getattr(bot_cfg.telegram, "admin_user_ids", []) or [])}
+        if not admin_ids:
+            return False
+        raw = getattr(msg, "raw_event", None)
+        if (
+            getattr(msg, "sender_is_bot", False)
+            or getattr(raw, "sender_is_bot", False)
+            or getattr(raw, "out", False)
+        ):
+            return False
+        return int(msg.sender_id) in admin_ids
+
+    @staticmethod
+    def _is_admin_private_dm(
         *,
         chat_id: int,
         bot_cfg: BotConfig,
         primary: IncomingMessage,
         messages: List[IncomingMessage],
-    ) -> Tuple[ToolProfile, Optional[str], Optional[str]]:
-        """Grant 'ops' ONLY for non-bot private DMs from admin_user_ids; 'chat' everywhere else."""
+    ) -> bool:
+        """Return True ONLY for non-bot private DMs from admin_user_ids."""
         admin_ids = {int(uid) for uid in (getattr(bot_cfg.telegram, "admin_user_ids", []) or [])}
         if not admin_ids or int(chat_id) <= 0:
-            return ("chat", None, None)
+            return False
 
         raw = getattr(primary, "raw_event", None)
         is_priv = bool(
@@ -1387,17 +2095,375 @@ class GroupBotOrchestrator:
             or (raw is not None and getattr(raw, "is_private", False) is True)
         )
         if not is_priv:
-            return ("chat", None, None)
+            return False
 
         raw_dict = getattr(raw, "raw_dict", None)
         if isinstance(raw_dict, dict):
             chat_type = str((raw_dict.get("chat") or {}).get("type") or "").strip().lower()
             if chat_type and chat_type != "private":
-                return ("chat", None, None)
+                return False
 
         if int(primary.sender_id) != int(chat_id) or int(primary.sender_id) not in admin_ids:
+            return False
+
+        if (
+            getattr(primary, "sender_is_bot", False)
+            or getattr(raw, "sender_is_bot", False)
+            or getattr(raw, "out", False)
+        ):
+            return False
+
+        for msg in messages:
+            m_raw = getattr(msg, "raw_event", None)
+            if (
+                getattr(msg, "sender_is_bot", False)
+                or getattr(m_raw, "sender_is_bot", False)
+                or getattr(m_raw, "out", False)
+                or int(msg.sender_id) not in admin_ids
+            ):
+                return False
+
+        return True
+
+    @staticmethod
+    def _split_slash_command(
+        text: str,
+        bot_username: Optional[str] = None,
+    ) -> Optional[Tuple[str, str, bool]]:
+        """Parse leading `/cmd[@bot] [arg]` returning `(cmd_lower, arg, addressed_to_other_bot)`."""
+        stripped = (text or "").strip()
+        if not stripped.startswith("/"):
+            return None
+        parts = stripped.split(None, 1)
+        head = parts[0]
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        if "@" in head:
+            cmd_part, target_bot = head.split("@", 1)
+            cmd_name = cmd_part.lower()
+            norm_target = target_bot.strip().lstrip("@").lower()
+            norm_self = (bot_username or "").strip().lstrip("@").lower()
+            if norm_target and norm_self and norm_target != norm_self:
+                return (cmd_name, arg, True)
+        else:
+            cmd_name = head.lower()
+        return (cmd_name, arg, False)
+
+    @classmethod
+    def _parse_ops_mode_command(
+        cls,
+        text: str,
+        bot_username: Optional[str] = None,
+    ) -> Optional[Tuple[str, bool]]:
+        """Parse `/ops`, `/tools`, or `/safemode` toggle commands into `(action, addressed_to_other_bot)`."""
+        parsed = cls._split_slash_command(text, bot_username=bot_username)
+        if parsed is None:
+            return None
+        cmd_name, arg, other_bot = parsed
+        if cmd_name not in ("/ops", "/tools", "/safemode"):
+            return None
+        if other_bot:
+            return ("status", True)
+
+        token = arg.split()[0].strip().lower() if arg else ""
+        if cmd_name == "/safemode":
+            if not token or token in ("status", "state"):
+                return ("status", False)
+            if token in ("on", "enable", "enabled", "1", "true", "вкл"):
+                return ("off", False)
+            if token in ("off", "disable", "disabled", "0", "false", "выкл"):
+                return ("on", False)
+            return ("help", False)
+
+        if not token or token in ("status", "state"):
+            return ("status", False)
+        if token in ("on", "enable", "enabled", "1", "true", "all", "вкл"):
+            return ("on", False)
+        if token in ("off", "disable", "disabled", "0", "false", "safe", "chat", "выкл"):
+            return ("off", False)
+        if token in ("admin", "dm", "admin_only", "admin-only"):
+            return ("admin", False)
+        return ("help", False)
+
+    def _find_ops_mode_command(
+        self,
+        messages: Sequence[IncomingMessage],
+    ) -> Optional[Tuple[IncomingMessage, str, bool]]:
+        """Find a `/ops`, `/tools`, or `/safemode` command in the message batch."""
+        bot_username = getattr(self.userbot, "bot_username", None)
+        for msg in reversed(messages):
+            candidate = (msg.text or "").strip()
+            if not candidate.startswith("/"):
+                continue
+            parsed = self._parse_ops_mode_command(candidate, bot_username=bot_username)
+            if parsed is not None:
+                return msg, parsed[0], parsed[1]
+        return None
+
+    async def _handle_ops_mode_command(
+        self,
+        *,
+        chat_id: int,
+        bot_cfg: BotConfig,
+        now: float,
+        cmd_msg: IncomingMessage,
+        action: str,
+        messages: List[IncomingMessage],
+    ) -> str:
+        """Handle `/ops on|off|admin|status` mode switching with SQLite persistence."""
+        await self._save_incoming_batch(messages, now=now)
+        mode_descriptions = {
+            "on": "🔓 ВКЛ (`on`) — полный набор инструментов Antigravity (команды, файлы, редактирование, субагенты, задачи, /evolve, /quota, /backup; без root) открыт во всех разрешённых группах и ЛС.",
+            "admin": "🛡 ТОЛЬКО АДМИН (`admin`) — полный набор инструментов работает только в ЛС администратора; группы и остальные ЛС в безопасном режиме `chat`.",
+            "off": "🔒 ВЫКЛ (`off`) — расширенный режим отключён везде; бот работает только в безопасном режиме `chat` (веб-поиск и чтение ссылок).",
+        }
+        if action in ("status", "help"):
+            desc = mode_descriptions.get(self._ops_tools_mode, self._ops_tools_mode)
+            reply_text = (
+                f"Режим расширенных инструментов: {desc}\n"
+                "Команды (для админа): `/ops off` — отключить, `/ops on` — включить везде, "
+                "`/ops admin` — только ЛС админа, `/ops status` — статус."
+            )
+        elif not self._is_admin_sender(cmd_msg, bot_cfg):
+            reply_text = "⛔ Переключать режим расширенных инструментов может только администратор."
+        else:
+            self._ops_tools_mode = action
+            setter = getattr(self.memory_store, "set_setting", None)
+            if callable(setter):
+                try:
+                    await setter(self._OPS_MODE_SETTING_KEY, action)
+                except Exception as exc:
+                    logger.warning("Failed persisting %s=%s: %s", self._OPS_MODE_SETTING_KEY, action, exc)
+            desc = mode_descriptions.get(action, action)
+            reply_text = f"Готово. {desc}"
+
+        safe_reply = self.sanitizer.sanitize(reply_text)
+        await self.userbot.send_reply(
+            chat_id=chat_id,
+            text=safe_reply,
+            reply_to_msg_id=cmd_msg.msg_id if cmd_msg.msg_id else None,
+        )
+        return safe_reply
+
+    def _find_ops_action_command(
+        self,
+        messages: Sequence[IncomingMessage],
+    ) -> Optional[Tuple[IncomingMessage, str, str, bool]]:
+        """Find `/quota`, `/backup`, `/evolve`, or `/self_edit` in the message batch."""
+        bot_username = getattr(self.userbot, "bot_username", None)
+        for msg in reversed(messages):
+            candidate = (msg.text or "").strip()
+            if not candidate.startswith("/"):
+                continue
+            parsed = self._split_slash_command(candidate, bot_username=bot_username)
+            if parsed is None:
+                continue
+            cmd_name, arg, other_bot = parsed
+            if cmd_name in ("/quota", "/backup", "/evolve", "/self_edit"):
+                return msg, cmd_name, arg, other_bot
+        return None
+
+    async def _handle_ops_action_command(
+        self,
+        *,
+        chat_id: int,
+        bot_cfg: BotConfig,
+        now: float,
+        cmd_msg: IncomingMessage,
+        cmd_name: str,
+        cmd_arg: str,
+        messages: List[IncomingMessage],
+    ) -> Tuple[bool, Optional[str]]:
+        """Execute `/quota`, `/backup`, `/evolve`, `/self_edit` respecting active ops_tools_mode."""
+        turn_profile, _, _ = self._resolve_turn_tool_profile(
+            chat_id=chat_id,
+            bot_cfg=bot_cfg,
+            primary=cmd_msg,
+            messages=messages,
+        )
+        is_admin = self._is_admin_sender(cmd_msg, bot_cfg)
+        admin_ids = {int(uid) for uid in (getattr(bot_cfg.telegram, "admin_user_ids", []) or [])}
+
+        if cmd_name == "/quota":
+            if turn_profile != "ops" and not is_admin:
+                return False, None
+            await self._save_incoming_batch(messages, now=now)
+            await asyncio.to_thread(self.quota_manager.sync_live_quota)
+            report = self.sanitizer.sanitize(self.quota_manager.format_quota_report())
+            await self.userbot.send_reply(
+                chat_id=chat_id,
+                text=report,
+                reply_to_msg_id=cmd_msg.msg_id if cmd_msg.msg_id else None,
+            )
+            return True, report
+
+        if cmd_name == "/backup":
+            if turn_profile != "ops" and not is_admin:
+                return False, None
+            await self._save_incoming_batch(messages, now=now)
+            res = await self._run_memory_backup_once()
+            if res is None:
+                msg = "Бэкап не выполнен: файл базы памяти ещё не создан."
+            else:
+                msg = (
+                    f"Бэкап памяти создан: `{res.backup_path.name}` "
+                    f"({res.size_bytes / 1024:.1f} KiB, удалено старых: {res.pruned_count})."
+                )
+            msg = self.sanitizer.sanitize(msg)
+            await self.userbot.send_reply(
+                chat_id=chat_id,
+                text=msg,
+                reply_to_msg_id=cmd_msg.msg_id if cmd_msg.msg_id else None,
+            )
+            return True, msg
+
+        if cmd_name in ("/evolve", "/self_edit"):
+            if not admin_ids:
+                return False, None
+            if turn_profile != "ops":
+                await self._save_incoming_batch(messages, now=now)
+                denied = self.sanitizer.sanitize(
+                    f"🔒 Самоэволюция недоступна: расширенный режим инструментов отключён "
+                    f"(текущий режим: `{self._ops_tools_mode}`). Администратор может включить его командой `/ops on`."
+                )
+                await self.userbot.send_reply(
+                    chat_id=chat_id,
+                    text=denied,
+                    reply_to_msg_id=cmd_msg.msg_id if cmd_msg.msg_id else None,
+                )
+                return True, denied
+
+            if not cmd_arg:
+                await self._save_incoming_batch(messages, now=now)
+                usage_msg = "Использование: `/evolve <описание задачи для самоэволюции>`"
+                await self.userbot.send_reply(
+                    chat_id=chat_id,
+                    text=usage_msg,
+                    reply_to_msg_id=cmd_msg.msg_id if cmd_msg.msg_id else None,
+                )
+                return True, usage_msg
+
+            if self.evolution_manager is None:
+                return False, None
+
+            await self._save_incoming_batch(messages, now=now)
+            allow_non_admin = self._ops_tools_mode == "on"
+            try:
+                evo_res = await self.evolution_manager.run_admin_task(
+                    user_id=cmd_msg.sender_id,
+                    task=cmd_arg,
+                    allow_non_admin=allow_non_admin,
+                )
+            except TypeError:
+                evo_res = await self.evolution_manager.run_admin_task(
+                    user_id=cmd_msg.sender_id,
+                    task=cmd_arg,
+                )
+            if evo_res is None:
+                reply_msg = "⚠️ Самоэволюция не выполнена (отключена в конфиге, отклонена или достигнут лимит)."
+            else:
+                verdict = getattr(evo_res, "verdict", "")
+                deploy_res = getattr(evo_res, "deploy_result", "")
+                summary = getattr(evo_res, "summary", "") or str(evo_res)
+                reply_msg = f"🛠 Self-Edit ({verdict or 'done'} / {deploy_res or 'n/a'}): {summary}"
+            reply_msg = self.sanitizer.sanitize(reply_msg)
+            await self.userbot.send_reply(
+                chat_id=chat_id,
+                text=reply_msg,
+                reply_to_msg_id=cmd_msg.msg_id if cmd_msg.msg_id else None,
+            )
+            return True, str(evo_res) if evo_res is not None else reply_msg
+
+        return False, None
+
+    @staticmethod
+    def _resolve_ops_workspace(agy_cfg: Any) -> Optional[str]:
+        """Resolve ops working directory: explicit `ops_cwd` override, else a lightweight workspace.
+
+        The default workspace (`antigravity.ops_workspace_dir`) is created automatically and
+        deliberately contains no AGENTS.md, so ops turns do not pull repo instructions into context.
+        """
+        if agy_cfg is None:
+            return None
+        explicit = getattr(agy_cfg, "ops_cwd", None)
+        if isinstance(explicit, str) and explicit.strip():
+            return explicit.strip()
+        workspace = getattr(agy_cfg, "ops_workspace_dir", None)
+        if not isinstance(workspace, str) or not workspace.strip():
+            return None
+        try:
+            path = Path(workspace.strip()).expanduser()
+            if not path.is_absolute():
+                path = Path.cwd() / path
+            path.mkdir(parents=True, exist_ok=True)
+            return str(path.resolve())
+        except OSError as exc:
+            logger.warning("Cannot create ops workspace %s: %s", workspace, exc)
+            return None
+
+    _ABORT_PROFILE_RE = re.compile(r"\bprofile=([A-Za-z0-9_.:-]+)")
+
+    @classmethod
+    def _extract_abort_profile(cls, exc: BaseException) -> str:
+        """Extract sanitized profile label from an AntigravityNativeToolAbort message."""
+        match = cls._ABORT_PROFILE_RE.search(str(exc))
+        return match.group(1) if match else "chat"
+
+    async def _send_native_tool_abort_notice(
+        self,
+        *,
+        chat_id: int,
+        tool_profile: Optional[str] = None,
+        reply_to_msg_id: Optional[int] = None,
+    ) -> None:
+        """Notify direct callers/admin DMs with a sanitized notice when a native tool call aborts."""
+        profile_label = (tool_profile or "chat").strip() or "chat"
+        notice = self.sanitizer.sanitize(
+            f"⚠️ Сработала защита инструментов (profile={profile_label}, запрос отклонён политикой безопасности)."
+        )
+        try:
+            await self.userbot.send_reply(
+                chat_id=chat_id,
+                text=notice,
+                reply_to_msg_id=reply_to_msg_id,
+                simulate_typing=False,
+            )
+        except Exception as notify_exc:
+            logger.debug(
+                "Failed to send native tool abort notice to chat %s: %s",
+                chat_id,
+                self.sanitizer.sanitize(str(notify_exc)),
+            )
+
+    @classmethod
+    def _needs_ops_tools(cls, text: str, media_text: Optional[str] = None) -> bool:
+        """Return True when the message or attachment text plausibly asks for an action that needs the ops toolset."""
+        for candidate in (text, media_text):
+            if candidate and (
+                cls._OPS_INTENT_RE.search(candidate) or cls._TOOL_INTENT_RE.search(candidate)
+            ):
+                return True
+        return False
+
+    def _resolve_turn_tool_profile(
+        self,
+        *,
+        chat_id: int,
+        bot_cfg: BotConfig,
+        primary: IncomingMessage,
+        messages: List[IncomingMessage],
+        ops_tools_mode: Optional[str] = None,
+    ) -> Tuple[ToolProfile, Optional[str], Optional[str]]:
+        """Resolve active tool_profile ('ops' vs 'chat') according to ops_tools_mode and access rules."""
+        admin_ids = {int(uid) for uid in (getattr(bot_cfg.telegram, "admin_user_ids", []) or [])}
+        # Fail-closed if no administrators are configured to control/disable ops mode.
+        if not admin_ids:
             return ("chat", None, None)
 
+        mode = (ops_tools_mode if ops_tools_mode is not None else self._ops_tools_mode).strip().lower()
+        if mode == "off":
+            return ("chat", None, None)
+
+        raw = getattr(primary, "raw_event", None)
         if (
             getattr(primary, "sender_is_bot", False)
             or getattr(raw, "sender_is_bot", False)
@@ -1411,14 +2477,38 @@ class GroupBotOrchestrator:
                 getattr(msg, "sender_is_bot", False)
                 or getattr(m_raw, "sender_is_bot", False)
                 or getattr(m_raw, "out", False)
-                or int(msg.sender_id) not in admin_ids
             ):
                 return ("chat", None, None)
 
         agy_cfg = getattr(bot_cfg, "antigravity", None)
         ops_mode = getattr(agy_cfg, "ops_mode", "auto") if agy_cfg is not None else "auto"
-        ops_cwd = getattr(agy_cfg, "ops_cwd", None) if agy_cfg is not None else None
-        return ("ops", ops_mode, ops_cwd)
+        ops_cwd = self._resolve_ops_workspace(agy_cfg)
+
+        if mode == "admin":
+            if self._is_admin_private_dm(
+                chat_id=chat_id,
+                bot_cfg=bot_cfg,
+                primary=primary,
+                messages=messages,
+            ):
+                return ("ops", ops_mode, ops_cwd)
+            return ("chat", None, None)
+
+        if mode == "on":
+            if int(chat_id) <= 0:
+                allowed_chats = {
+                    int(cid) for cid in (getattr(bot_cfg.telegram, "allowed_chat_ids", []) or [])
+                }
+                if int(chat_id) not in allowed_chats:
+                    return ("chat", None, None)
+                return ("ops", ops_mode, ops_cwd)
+
+            allowed_dms = set(self._effective_dm_user_ids(bot_cfg))
+            if int(chat_id) not in allowed_dms or int(primary.sender_id) not in allowed_dms:
+                return ("chat", None, None)
+            return ("ops", ops_mode, ops_cwd)
+
+        return ("chat", None, None)
 
     async def _complete_reply_turn(
         self,
@@ -1454,8 +2544,15 @@ class GroupBotOrchestrator:
             )
             return None
 
-        # Fail fast if provider circuit breaker is open
-        if self._is_provider_rate_limited():
+        # Fail fast if provider circuit breaker is open for all candidate models of this role
+        is_admin_dm_early = self._is_admin_private_dm(
+            chat_id=chat_id,
+            bot_cfg=bot_cfg,
+            primary=primary,
+            messages=messages,
+        )
+        early_role = "dm_admin" if is_admin_dm_early else "group"
+        if self._is_provider_rate_limited(role=early_role):
             logger.info("Skipping LLM reply for chat %s while provider is rate-limited.", chat_id)
             return None
 
@@ -1512,6 +2609,33 @@ class GroupBotOrchestrator:
             and bot_cfg.voice.tts.reply_voice_to_voice
         )
 
+        is_admin_dm = is_admin_dm_early
+        tool_profile, ops_mode, ops_cwd = self._resolve_turn_tool_profile(
+            chat_id=chat_id,
+            bot_cfg=bot_cfg,
+            primary=primary,
+            messages=messages,
+        )
+        # Ops is *permitted* here; for non-admin-DM turns only escalate to the expensive tool
+        # profile when the message or attachment/STT text looks like an action/tool request.
+        # Admin private DMs retain ops whenever ops_tools_mode permits it (not "off").
+        attachment_text = (
+            "\n".join(
+                dict.fromkeys(
+                    s.strip()
+                    for s in (media_text, raw_media_text)
+                    if isinstance(s, str) and s.strip()
+                )
+            )
+            or None
+        )
+        if (
+            tool_profile != "chat"
+            and not is_admin_dm
+            and not self._needs_ops_tools(combined_text, media_text=attachment_text)
+        ):
+            tool_profile, ops_mode, ops_cwd = "chat", None, None
+
         prompt = self.build_context_prompt(
             incoming=primary,
             recent_history=recent_history,
@@ -1523,6 +2647,7 @@ class GroupBotOrchestrator:
             incoming_messages=messages,
             media_from_reply=is_reply_media,
             voice_reply_mode=wants_voice_reply,
+            ops_tools_enabled=(tool_profile != "chat"),
         )
 
         # Immediately signal typing status while LLM generates the response
@@ -1535,22 +2660,16 @@ class GroupBotOrchestrator:
                 await self.userbot.send_typing_action(chat_id)
             pre_typed = True
 
-        tool_profile, ops_mode, ops_cwd = self._resolve_turn_tool_profile(
-            chat_id=chat_id,
-            bot_cfg=bot_cfg,
-            primary=primary,
-            messages=messages,
-        )
-        usage_role = "dm_admin" if tool_profile != "chat" else "group"
-        quota_ctx = self.quota_manager.format_context_summary()
-        effective_system_prompt = (
-            f"{self.config_mgr.system_prompt}\n\n{quota_ctx}"
-            if self.config_mgr.system_prompt
-            else quota_ctx
-        )
+        usage_role = "dm_admin" if is_admin_dm else "group"
+        # Keep the system prompt a byte-stable prefix (Prompt Caching). Dynamic quota state is
+        # appended to the END of the per-turn prompt, and only when actionable.
+        effective_system_prompt = self.config_mgr.system_prompt or ""
+        quota_hint = self.quota_manager.format_context_hint()
+        if quota_hint:
+            prompt = f"{prompt}\n\n{quota_hint}"
 
         resp: Optional[ProviderResponse] = None
-        chosen_model = self.quota_manager.select_model(usage_role)[0]
+        chosen_model: str = bot_cfg.models.group.model
         max_fallback_tries = max(2, 1 + len(bot_cfg.models.fallback_models))
         tried_models: set[str] = set()
 
@@ -1593,6 +2712,28 @@ class GroupBotOrchestrator:
                 break
             except Exception as exc:
                 verdict = getattr(exc, "verdict", None) or classify_error(exc)
+                if verdict.category == ErrorCategory.NATIVE_TOOL_ABORT or isinstance(
+                    exc, AntigravityNativeToolAbort
+                ):
+                    if not getattr(exc, "_native_tool_abort_logged", False):
+                        logger.warning(
+                            "Native tool execution aborted in chat %s (model=%s, role=%s): %s",
+                            chat_id,
+                            chosen_model,
+                            usage_role,
+                            self.sanitizer.sanitize(str(exc)),
+                        )
+                        try:
+                            setattr(exc, "_native_tool_abort_logged", True)
+                        except Exception:
+                            pass
+                    if is_admin_dm or decision == ReplyAction.MUST_REPLY:
+                        await self._send_native_tool_abort_notice(
+                            chat_id=chat_id,
+                            tool_profile=tool_profile,
+                            reply_to_msg_id=primary.msg_id if primary.msg_id else None,
+                        )
+                    return None
                 if verdict.category in (ErrorCategory.RATE_LIMIT, ErrorCategory.MODEL_NOT_FOUND):
                     retry_after = extract_retry_after(exc)
                     self.quota_manager.record_rate_limit(
@@ -1638,15 +2779,21 @@ class GroupBotOrchestrator:
             return None
 
         doc_specs, text_without_docs = extract_document_specs(raw_reply_text)
-        text_without_skip = self._SKIP_TAG_RE.sub("", text_without_docs).strip()
+        text_without_imgs, image_specs = extract_image_specs(text_without_docs, max_specs=1)
+        text_without_skip = self._SKIP_TAG_RE.sub("", text_without_imgs).strip()
         reaction_emoji, reply_text = self.extract_reaction_tag(text_without_skip)
+
+        img_cfg = bot_cfg.image_generation
+        should_generate_image = bool(
+            image_specs and img_cfg.enabled and img_cfg.allow_natural_language_trigger
+        )
 
         reaction_sent = False
         if reaction_emoji and bot_cfg.behavior.reactions_enabled and primary.msg_id:
             await self.userbot.send_reaction(chat_id, primary.msg_id, reaction_emoji)
             reaction_sent = True
 
-        if not reply_text and not doc_specs:
+        if not reply_text and not doc_specs and not should_generate_image:
             if reaction_sent:
                 react_ts = time.time()
                 state["last_bot_msg_time"] = react_ts
@@ -1764,7 +2911,51 @@ class GroupBotOrchestrator:
                     ),
                 )
 
-        if not reply_text and not delivered_docs:
+        history_text = ""
+        if reply_text or delivered_docs:
+            sent_ts = time.time()
+            state["last_bot_msg_time"] = sent_ts
+            if decision != ReplyAction.SPONTANEOUS_REPLY:
+                self.heuristics.record_reply(chat_id, timestamp=sent_ts)
+            self._record_used_facts(chat_id, facts, now=sent_ts)
+
+            sent_msg_id = self._extract_sent_message_id(
+                sent_res if sent_res is not None else last_doc_res
+            )
+
+            doc_summary = ""
+            if delivered_docs:
+                doc_names = ", ".join(doc.filename for doc in delivered_docs)
+                doc_summary = f"[Документы: {doc_names}]"
+
+            history_text = f"{reply_text} {doc_summary}".strip() if doc_summary else reply_text
+
+            saved_media_type: Optional[str] = None
+            saved_media_summary: Optional[str] = None
+            if delivered_docs:
+                saved_media_type = "document"
+            elif sent_as_voice:
+                saved_media_type = "voice"
+                saved_media_summary = (
+                    f"Голосовой ответ ({voice_lang})" if voice_lang else "Голосовой ответ"
+                )
+
+            # Save bot's own response into short-term history
+            bot_name = bot_cfg.behavior.bot_names[0] if bot_cfg.behavior.bot_names else "Джефф"
+            await self.memory_store.save_message(
+                ChatMessage(
+                    telegram_msg_id=sent_msg_id,
+                    chat_id=chat_id,
+                    user_id=self.userbot.bot_id or 1,
+                    timestamp=int(sent_ts),
+                    author_name=bot_name,
+                    text=history_text,
+                    reply_to_msg_id=primary.msg_id,
+                    media_type=saved_media_type,
+                    media_summary=saved_media_summary,
+                )
+            )
+        elif not should_generate_image:
             if doc_send_failed:
                 logger.warning(
                     "Document generation/send failed with no text reply for chat %s",
@@ -1778,57 +2969,34 @@ class GroupBotOrchestrator:
                 self._record_used_facts(chat_id, facts, now=react_ts)
             return None
 
-        sent_ts = time.time()
-        state["last_bot_msg_time"] = sent_ts
-        if decision != ReplyAction.SPONTANEOUS_REPLY:
-            self.heuristics.record_reply(chat_id, timestamp=sent_ts)
-        self._record_used_facts(chat_id, facts, now=sent_ts)
-
-        sent_msg_id = self._extract_sent_message_id(
-            sent_res if sent_res is not None else last_doc_res
-        )
-
-        doc_summary = ""
-        if delivered_docs:
-            doc_names = ", ".join(doc.filename for doc in delivered_docs)
-            doc_summary = f"[Документы: {doc_names}]"
-
-        history_text = f"{reply_text} {doc_summary}".strip() if doc_summary else reply_text
-
-        saved_media_type: Optional[str] = None
-        saved_media_summary: Optional[str] = None
-        if delivered_docs:
-            saved_media_type = "document"
-        elif sent_as_voice:
-            saved_media_type = "voice"
-            saved_media_summary = (
-                f"Голосовой ответ ({voice_lang})" if voice_lang else "Голосовой ответ"
-            )
-
-        # Save bot's own response into short-term history
-        bot_name = bot_cfg.behavior.bot_names[0] if bot_cfg.behavior.bot_names else "Джефф"
-        await self.memory_store.save_message(
-            ChatMessage(
-                telegram_msg_id=sent_msg_id,
+        if should_generate_image:
+            img_spec = image_specs[0]
+            ref_images = [
+                att
+                for att in attachments
+                if (att.mime_type or "").lower().startswith("image/")
+                and ((att.file_path is not None and att.file_path.exists()) or bool(att.data))
+            ]
+            img_result_text = await self._execute_image_generation(
                 chat_id=chat_id,
-                user_id=self.userbot.bot_id or 1,
-                timestamp=int(sent_ts),
-                author_name=bot_name,
-                text=history_text,
-                reply_to_msg_id=primary.msg_id,
-                media_type=saved_media_type,
-                media_summary=saved_media_summary,
+                user_id=primary.sender_id,
+                bot_cfg=bot_cfg,
+                state=state,
+                prompt=img_spec.prompt,
+                caption=img_spec.caption or None,
+                aspect_ratio=img_spec.aspect_ratio,
+                reference_images=ref_images or None,
+                reply_to_msg_id=primary.msg_id if primary.msg_id else None,
+                decision=decision,
+                send_error_reply=True,
             )
-        )
+            if not history_text and img_result_text:
+                history_text = img_result_text
+                self._record_used_facts(chat_id, facts, now=time.time())
 
-        # Trigger background compaction if threshold reached and provider is not rate-limited
-        if not self._is_provider_rate_limited():
-            bot_uid = getattr(self.userbot, "bot_id", None)
-            excluded_uids = [int(bot_uid)] if bot_uid else None
-            await self.compaction_engine.run_compaction_for_chat(
-                chat_id,
-                excluded_user_ids=excluded_uids,
-            )
+        if not history_text:
+            return None
+
         return history_text
 
     def _get_proactive_target_chat_ids(self) -> List[int]:
@@ -1921,6 +3089,7 @@ class GroupBotOrchestrator:
     async def start(self) -> None:
         """Start all subsystems (SQLite DB, config watcher, Telegram MTProto client, proactive loop)."""
         await self.memory_store.init_db()
+        await self._ensure_ops_tools_mode_loaded()
         await self.quota_manager.sync_from_db()
         await self.config_mgr.start_watcher()
         await self.userbot.start()
@@ -1999,15 +3168,27 @@ class GroupBotOrchestrator:
                 pass
         self._backup_task = None
 
+        cancelled_debounce: List[asyncio.Task[Any]] = []
         for task in list(self._debounce_tasks.values()):
             if not task.done():
                 task.cancel()
+                cancelled_debounce.append(task)
         self._debounce_tasks.clear()
         self._debounce_buffers.clear()
         self._debounce_started_at.clear()
+        if cancelled_debounce:
+            await asyncio.gather(*cancelled_debounce, return_exceptions=True)
 
+        proactive_task = getattr(self.proactive_engine, "_loop_task", None)
         self.proactive_engine.stop_loop()
+        if isinstance(proactive_task, asyncio.Task) and not proactive_task.done():
+            await asyncio.gather(proactive_task, return_exceptions=True)
+
+        watcher_task = getattr(self.config_mgr, "_watcher_task", None)
         self.config_mgr.stop_watcher()
+        if isinstance(watcher_task, asyncio.Task) and not watcher_task.done():
+            await asyncio.gather(watcher_task, return_exceptions=True)
+
         await self.userbot.stop()
         if self._owns_stt_transcriber and hasattr(self.stt_transcriber, "close"):
             self.stt_transcriber.close()

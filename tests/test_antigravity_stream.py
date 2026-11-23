@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
@@ -274,3 +275,192 @@ def test_search_web_and_read_url_content_allowed_while_run_command_aborted():
             )
         assert p_forbid.native_tool_intercepted is True
     assert intercept_count == 4
+
+
+def test_non_tool_step_update_with_bare_name_and_safe_step_types_do_not_abort(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Bare 'name' or safe non-tool step_types must not trigger native tool abort."""
+    parser = AntigravityStreamParser(tool_profile="chat")
+    events = [
+        # Omitted step_type with bare "name" metadata
+        {"event": "step_update", "step_update": {"name": "step_one", "text_delta": "Hello "}},
+        # Unknown non-tool step_type with bare "name"
+        {
+            "event": "step_update",
+            "step_update": {"step_type": "checkpoint", "name": "cp_1", "thinking_delta": "Check..."},
+        },
+        # All known safe non-tool step_types with bare "name"
+        *[
+            {
+                "event": "step_update",
+                "step_update": {
+                    "step_type": safe_type,
+                    "name": f"{safe_type}_item",
+                    "text_delta": "ok " if safe_type == "agent_response" else "",
+                },
+            }
+            for safe_type in (
+                "user_input",
+                "agent_response",
+                "system_message",
+                "thinking",
+                "thought",
+                "reasoning",
+                "planner_response",
+                "status",
+                "metadata",
+            )
+        ],
+    ]
+
+    with caplog.at_level(logging.WARNING, logger="bot.antigravity.stream"):
+        chunks = []
+        for ev in events:
+            chunks.extend(parser.feed_line(json.dumps(ev)))
+        chunks.extend(parser.finish())
+
+    assert parser.native_tool_intercepted is False
+    assert caplog.records == []
+    assert "".join(c.text for c in chunks if c.text) == "Hello ok "
+    assert "".join(c.thinking for c in chunks if c.thinking) == "Check..."
+
+
+def test_explicit_tool_fields_without_tool_step_type_still_abort() -> None:
+    """Explicit tool/subagent payload fields still abort when step_type is omitted/unknown."""
+    payloads = [
+        {"tool_name": "run_command"},
+        {"toolName": "bash"},
+        {"toolname": "exec"},
+        {"tool": "view_file"},
+        {"tool_info": {"name": "write_file"}},
+        {"toolInfo": {"name": "edit_file"}},
+        {"function": {"name": "run_command", "arguments": "{}"}},
+        {"subagent_info": {"subagents": [{"type_name": "general"}]}},
+        {"subagentInfo": {"subagents": [{"type_name": "general"}]}},
+    ]
+    for step_payload in payloads:
+        parser = AntigravityStreamParser(tool_profile="chat")
+        with pytest.raises(AntigravityNativeToolAbort):
+            parser.feed_line(json.dumps({"event": "step_update", "step_update": step_payload}))
+        assert parser.native_tool_intercepted is True
+
+
+def test_native_tool_abort_logs_single_sanitized_warning_across_paths(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Stream interception logs one sanitized WARNING with profile, source, step_type, tool/keys, and zero secrets."""
+    secret_cmd = "cat /opt/telegram-group-bot/.env"
+    secret_tok = "sk-proj-SUPERSECRET1234567890"
+    secret_prompt = "PRIVATE_PROMPT_CONTENT"
+
+    # 1. step_update with named tool -> logs tool_name, omits keys=, hides secrets
+    p1 = AntigravityStreamParser(tool_profile="chat")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="bot.antigravity.stream"):
+        with pytest.raises(AntigravityNativeToolAbort) as exc1:
+            p1.feed_line(
+                json.dumps({
+                    "event": "step_update",
+                    "step_update": {
+                        "step_type": "tool",
+                        "tool_name": "run_command",
+                        "tool_info": {
+                            "name": "run_command",
+                            "parameters": {"command": secret_cmd, "token": secret_tok},
+                        },
+                    },
+                })
+            )
+    assert getattr(exc1.value, "_native_tool_abort_logged", False) is True
+    assert len(caplog.records) == 1
+    msg1 = caplog.records[0].getMessage()
+    assert "tool_profile=chat" in msg1
+    assert "source=step_update" in msg1
+    assert "step_type=tool" in msg1
+    assert "tool_name=run_command" in msg1
+    assert "subagents=none" in msg1
+    assert "keys=" not in msg1
+    assert secret_cmd not in msg1
+    assert secret_tok not in msg1
+
+    # 2. assistant message-level unnamed tool -> logs empty tool_name and safe keys=
+    p2 = AntigravityStreamParser(tool_profile="ops")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="bot.antigravity.stream"):
+        with pytest.raises(AntigravityNativeToolAbort):
+            p2.feed_line(
+                json.dumps({
+                    "event": "assistant",
+                    "message": {
+                        "step_type": "tool",
+                        "content": [{"type": "text", "text": secret_prompt}],
+                    },
+                })
+            )
+    assert len(caplog.records) == 1
+    msg2 = caplog.records[0].getMessage()
+    assert "tool_profile=ops" in msg2
+    assert "source=assistant" in msg2
+    assert "step_type=tool" in msg2
+    assert "tool_name=, " in msg2
+    assert "keys=content,step_type" in msg2
+    assert secret_prompt not in msg2
+
+    # 3. assistant.content subagent block -> logs subagents and hides role/prompt
+    p3 = AntigravityStreamParser(tool_profile="chat")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="bot.antigravity.stream"):
+        with pytest.raises(AntigravityNativeToolAbort):
+            p3.feed_line(
+                json.dumps({
+                    "event": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "subagent",
+                                "tool_name": "invoke_subagent",
+                                "subagent_info": {
+                                    "subagents": [
+                                        {
+                                            "type_name": "research",
+                                            "prompt": secret_prompt,
+                                            "token": secret_tok,
+                                        }
+                                    ]
+                                },
+                            }
+                        ]
+                    },
+                })
+            )
+    assert len(caplog.records) == 1
+    msg3 = caplog.records[0].getMessage()
+    assert "tool_profile=chat" in msg3
+    assert "source=assistant.content" in msg3
+    assert "step_type=subagent" in msg3
+    assert "tool_name=invoke_subagent" in msg3
+    assert "subagents=research" in msg3
+    assert "keys=" not in msg3
+    assert secret_prompt not in msg3
+    assert secret_tok not in msg3
+
+    # 4. smuggled secret in tool_name -> logs tool_name=<redacted> and keys=
+    p4 = AntigravityStreamParser(tool_profile="chat")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="bot.antigravity.stream"):
+        with pytest.raises(AntigravityNativeToolAbort):
+            p4.feed_line(
+                json.dumps({
+                    "event": "step_update",
+                    "step_update": {
+                        "step_type": "tool",
+                        "tool_name": f"bash {secret_tok}",
+                    },
+                })
+            )
+    assert len(caplog.records) == 1
+    msg4 = caplog.records[0].getMessage()
+    assert "tool_name=<redacted>" in msg4
+    assert "keys=step_type,tool_name" in msg4
+    assert secret_tok not in msg4
