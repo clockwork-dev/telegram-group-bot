@@ -100,7 +100,8 @@ _API_TOKEN_RE = re.compile(
     r"(?:"
     r"ya29\.[0-9A-Za-z_\-]{16,}"
     r"|1//0[0-9A-Za-z_\-]{20,}"
-    r"|AIza[0-9A-Za-z_\-]{25,}"
+    r"|AIza[0-9A-Za-z_\-]{20,}"
+    r"|AQ\.[0-9A-Za-z_\-]{20,}"
     r"|sk-(?:proj-|ant-[A-Za-z0-9_\-]*|svcacct-)?[A-Za-z0-9_\-]{16,}"
     r"|gh[pousr]_[A-Za-z0-9_]{20,}"
     r"|github_pat_[A-Za-z0-9_]{20,}"
@@ -358,7 +359,16 @@ def install_log_sanitizer(sanitizer: SecretSanitizer) -> SanitizingLogFilter:
     for handler in root_logger.handlers:
         _attach_filter_idempotent(handler, log_filter)
 
-    for logger_name in ("bot", "httpx", "telegram"):
+    for logger_name in (
+        "bot",
+        "httpx",
+        "httpx2",
+        "google_genai",
+        "google",
+        "aiohttp",
+        "edge_tts",
+        "telegram",
+    ):
         sub_logger = logging.getLogger(logger_name)
         _attach_filter_idempotent(sub_logger, log_filter)
         for handler in sub_logger.handlers:

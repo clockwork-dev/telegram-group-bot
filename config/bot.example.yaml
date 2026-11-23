@@ -93,6 +93,8 @@ memory:
 voice:
   tts:
     enabled: true
+    provider: "auto" # "auto" (Gemini when API key is set, else Edge), "gemini", or "edge"
+    fallback_to_edge: true
     ru_voice: "ru-RU-SvetlanaNeural"
     uk_voice: "uk-UA-PolinaNeural"
     rate: "+0%"
@@ -100,6 +102,11 @@ voice:
     max_chars: 600
     timeout_sec: 25.0
     reply_voice_to_voice: true
+    gemini_model: "gemini-2.5-flash-preview-tts"
+    gemini_ru_voice: "Aoede"
+    gemini_uk_voice: "Aoede"
+    gemini_style_prompt: "Warm, lively young woman chatting casually with close friends; natural conversational cadence with expressive intonation, subtle playful sarcasm, and clear Russian/Ukrainian pronunciation—never robotic or announcer-like."
+    gemini_api_key_env: "GEMINI_API_KEY"
   stt:
     enabled: true
     model_size: "base"
@@ -131,7 +138,7 @@ antigravity:
   data_dir: "data/antigravity"
   model: "gemini-4-hydrogen"
   effort: "low"
-  enable_sdk: true
+  enable_sdk: false # Keep false when GEMINI_API_KEY is set for Gemini TTS so chat stays on OAuth agy CLI
   enable_cli_fallback: true
   max_retries: 3
   rate_limit_max_retries: 0

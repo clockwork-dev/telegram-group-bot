@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import os
 import re
 import signal
 import tempfile
@@ -46,7 +47,7 @@ from bot.media.image_gen import (
 )
 from bot.media.processor import MediaProcessor, ProcessedMedia, _has_media_flag
 from bot.media.stt import STTTranscriber
-from bot.media.tts import TTSSkippedError, TTSSynthesizer
+from bot.media.tts import TTSSkippedError, TTSSynthesizer, strip_tts_emotion_tags
 from bot.memory.compaction import CompactionEngine
 from bot.memory.db import ChatMessage, MemoryStore
 from bot.memory.fts import FactRecord, extract_archive_terms, extract_fact_terms
@@ -216,6 +217,7 @@ class GroupBotOrchestrator:
             memory_store=self.memory_store,
             quota_manager=self.quota_manager,
             provider=self.provider,
+            sanitizer=self.sanitizer,
         )
         self.proactive_engine = proactive_engine or ProactiveEngine(
             config_mgr=self.config_mgr,
@@ -324,19 +326,28 @@ class GroupBotOrchestrator:
         return merged
 
     def _register_config_secrets(self, bot_cfg: BotConfig) -> None:
-        """Register configured non-dummy Telegram tokens/hashes in SecretSanitizer."""
+        """Register configured non-dummy Telegram/TTS tokens/hashes in SecretSanitizer."""
         if bot_cfg.telegram.bot_token:
             self.sanitizer.register_secret(bot_cfg.telegram.bot_token)
         api_hash = (bot_cfg.telegram.api_hash or "").strip()
         if api_hash and "0123456789abcdef" not in api_hash.lower():
             self.sanitizer.register_secret(api_hash)
+        tts_cfg = bot_cfg.voice.tts
+        if tts_cfg.gemini_api_key:
+            self.sanitizer.register_secret(tts_cfg.gemini_api_key)
+        for env_name in (tts_cfg.gemini_api_key_env, "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+            if env_name:
+                env_val = os.environ.get(env_name)
+                if env_val:
+                    self.sanitizer.register_secret(env_val)
 
     def _on_config_reloaded(self) -> None:
-        """Synchronize Telegram access lists, image limiter, and secret sanitizer on ConfigManager reload."""
+        """Synchronize Telegram access lists, voice settings, image limiter, and secret sanitizer on reload."""
         bot_cfg = self.config_mgr.bot
         if bot_cfg is None:
             return
         self._register_config_secrets(bot_cfg)
+        self._sync_voice_configs(bot_cfg)
         self._image_limiter.update_config(bot_cfg.image_generation)
         resolved_token = resolve_bot_token_from_env_or_config(bot_cfg.telegram.bot_token)
         if resolved_token:
@@ -467,12 +478,20 @@ class GroupBotOrchestrator:
         if self._owns_tts_synthesizer:
             tts_cfg = bot_cfg.voice.tts
             self.tts_synthesizer.enabled = bool(tts_cfg.enabled)
+            self.tts_synthesizer.provider = tts_cfg.provider
+            self.tts_synthesizer.fallback_to_edge = bool(tts_cfg.fallback_to_edge)
             self.tts_synthesizer.ru_voice = tts_cfg.ru_voice
             self.tts_synthesizer.uk_voice = tts_cfg.uk_voice
             self.tts_synthesizer.rate = tts_cfg.rate
             self.tts_synthesizer.pitch = tts_cfg.pitch
             self.tts_synthesizer.max_chars = int(tts_cfg.max_chars)
             self.tts_synthesizer.timeout_sec = float(tts_cfg.timeout_sec)
+            self.tts_synthesizer.gemini_model = tts_cfg.gemini_model
+            self.tts_synthesizer.gemini_ru_voice = tts_cfg.gemini_ru_voice
+            self.tts_synthesizer.gemini_uk_voice = tts_cfg.gemini_uk_voice
+            self.tts_synthesizer.gemini_style_prompt = tts_cfg.gemini_style_prompt
+            self.tts_synthesizer.gemini_api_key_env = tts_cfg.gemini_api_key_env
+            self.tts_synthesizer.gemini_api_key = tts_cfg.gemini_api_key
             self.tts_synthesizer.ffmpeg_path = bot_cfg.media.ffmpeg_path
             self.tts_synthesizer.temp_dir_base = bot_cfg.media.temp_dir
 
@@ -996,7 +1015,13 @@ class GroupBotOrchestrator:
         if voice_reply_mode:
             guidance += (
                 "\nГОЛОСОВОЙ ОТВЕТ: собеседник отправил голосовое сообщение, твой ответ будет озвучен голосом (TTS). "
-                "Отвечай максимально естественно, живо и разговорно (1-2 коротких предложения), "
+                "Начни ответ с короткой директивы настроения под момент в формате "
+                "`[MOOD: <2-6 English words describing emotion/pace>]` "
+                "(например: `[MOOD: playful sarcasm]`, `[MOOD: amused sigh]`, "
+                "`[MOOD: conspiratorial whisper]`, `[MOOD: annoyed, fast pace]`, `[MOOD: warm and excited]`). "
+                "Далее пиши 1-2 короткие разговорные фразы, как говорят вслух, "
+                "уместно вплетая естественные вокальные теги (`[sigh]`, `[chuckles]`, `[laughs]`, "
+                "`[whispers]`, `[excitement]`, `[short pause]`) и многоточия `...`. "
                 "БЕЗ Markdown-разметки, БЕЗ таблиц, списков, блоков кода и URL-ссылок."
             )
         if ops_tools_enabled:
@@ -2812,10 +2837,15 @@ class GroupBotOrchestrator:
                     doc_specs
                 ) as generated_docs:
                     for idx, gen_doc in enumerate(generated_docs):
-                        use_reply_caption = (
-                            idx == 0 and bool(reply_text) and len(reply_text) <= 1024
+                        stripped_reply_caption = (
+                            strip_tts_emotion_tags(reply_text) if idx == 0 and reply_text else ""
                         )
-                        doc_caption = reply_text if use_reply_caption else gen_doc.caption
+                        use_reply_caption = (
+                            bool(stripped_reply_caption) and len(stripped_reply_caption) <= 1024
+                        )
+                        doc_caption = (
+                            stripped_reply_caption if use_reply_caption else gen_doc.caption
+                        )
                         try:
                             doc_res = await self.userbot.send_document(
                                 chat_id=chat_id,
@@ -2896,23 +2926,26 @@ class GroupBotOrchestrator:
                     logger.warning(
                         "Voice reply failed in chat %s; falling back to text: %s",
                         chat_id,
-                        exc,
+                        self.sanitizer.sanitize(exc),
                     )
 
             if not sent_as_voice:
-                sent_res = await self.userbot.send_reply(
-                    chat_id=chat_id,
-                    text=reply_text,
-                    reply_to_msg_id=primary.msg_id if primary.msg_id else None,
-                    simulate_typing=(
-                        bot_cfg.behavior.typing_simulation
-                        and not pre_typed
-                        and not delivered_docs
-                    ),
-                )
+                reply_text = strip_tts_emotion_tags(reply_text)
+                if reply_text:
+                    sent_res = await self.userbot.send_reply(
+                        chat_id=chat_id,
+                        text=reply_text,
+                        reply_to_msg_id=primary.msg_id if primary.msg_id else None,
+                        simulate_typing=(
+                            bot_cfg.behavior.typing_simulation
+                            and not pre_typed
+                            and not delivered_docs
+                        ),
+                    )
 
+        clean_history_reply = strip_tts_emotion_tags(reply_text) if reply_text else ""
         history_text = ""
-        if reply_text or delivered_docs:
+        if clean_history_reply or delivered_docs or sent_as_voice:
             sent_ts = time.time()
             state["last_bot_msg_time"] = sent_ts
             if decision != ReplyAction.SPONTANEOUS_REPLY:
@@ -2928,7 +2961,11 @@ class GroupBotOrchestrator:
                 doc_names = ", ".join(doc.filename for doc in delivered_docs)
                 doc_summary = f"[Документы: {doc_names}]"
 
-            history_text = f"{reply_text} {doc_summary}".strip() if doc_summary else reply_text
+            history_text = (
+                f"{clean_history_reply} {doc_summary}".strip()
+                if doc_summary
+                else clean_history_reply
+            )
 
             saved_media_type: Optional[str] = None
             saved_media_summary: Optional[str] = None

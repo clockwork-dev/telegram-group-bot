@@ -44,13 +44,16 @@ from bot.media.stt import (
     probe_wav_duration,
 )
 from bot.media.tts import (
+    RECOMMENDED_GEMINI_FEMALE_VOICES,
     TTSError,
     TTSResult,
     TTSSkippedError,
     TTSSynthesizer,
     detect_speech_language,
+    extract_tts_mood_and_text,
     probe_audio_duration,
     sanitize_text_for_tts,
+    strip_tts_emotion_tags,
     transcode_to_telegram_voice,
 )
 
@@ -79,12 +82,15 @@ __all__ = [
     "is_stt_available",
     "load_wav_audio",
     "probe_wav_duration",
+    "RECOMMENDED_GEMINI_FEMALE_VOICES",
     "TTSError",
     "TTSSkippedError",
     "TTSResult",
     "TTSSynthesizer",
     "detect_speech_language",
+    "extract_tts_mood_and_text",
     "sanitize_text_for_tts",
+    "strip_tts_emotion_tags",
     "transcode_to_telegram_voice",
     "probe_audio_duration",
     "ALLOWED_ASPECT_RATIOS",

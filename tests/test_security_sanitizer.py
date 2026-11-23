@@ -92,6 +92,7 @@ def test_sanitizer_patterns_and_git_sha_preservation():
         "oauth=ya29.a0AfH6SMC1234567890abcdef "
         "refresh=1//0gTestRefreshTokenValue1234567890ABCDEF "
         "gkey=AIzaSyDummyKeyValue1234567890abcdef "
+        "aqkey=AQ.Ab8RN6DummyGoogleKeyValue1234567890abcdef "
         "openai=sk-proj-TestKey1234567890abcdef "
         "gh=ghp_1234567890abcdefghij1234567890 "
         "aws=AKIAIOSFODNN7EXAMPLE "
@@ -103,6 +104,7 @@ def test_sanitizer_patterns_and_git_sha_preservation():
         "ya29.a0AfH6SMC1234567890abcdef",
         "1//0gTestRefreshTokenValue1234567890ABCDEF",
         "AIzaSyDummyKeyValue1234567890abcdef",
+        "AQ.Ab8RN6DummyGoogleKeyValue1234567890abcdef",
         "sk-proj-TestKey1234567890abcdef",
         "ghp_1234567890abcdefghij1234567890",
         "AKIAIOSFODNN7EXAMPLE",
@@ -337,3 +339,45 @@ async def test_orchestrator_sanitizes_outbound_reply_and_proactive(tmp_path: Pat
             assert REDACTED in reply
     finally:
         await orch.stop()
+
+
+def test_install_log_sanitizer_covers_tts_and_http_loggers():
+    gemini_secret = "AIzaSyLogSanitizerTestKey1234567890abcdef"
+    sanitizer = SecretSanitizer(extra_secrets=[gemini_secret], load_environ=False)
+
+    root_logger = logging.getLogger()
+    records_out: list[str] = []
+
+    class _ListHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records_out.append(self.format(record))
+
+    handler = _ListHandler()
+    handler.setFormatter(logging.Formatter("%(name)s:%(message)s"))
+    root_logger.addHandler(handler)
+    old_level = root_logger.level
+    root_logger.setLevel(logging.DEBUG)
+
+    target_loggers = ("httpx2", "google_genai", "google", "aiohttp", "edge_tts")
+    saved_states = {}
+    try:
+        install_log_sanitizer(sanitizer)
+        for name in target_loggers:
+            sub = logging.getLogger(name)
+            saved_states[name] = (sub.level, sub.propagate)
+            sub.setLevel(logging.DEBUG)
+            sub.propagate = True
+            assert any(isinstance(f, SanitizingLogFilter) for f in sub.filters)
+            sub.info("Request failed key=%s aq=AQ.Ab8RN6SecretToken1234567890", gemini_secret)
+
+        joined = "\n".join(records_out)
+        assert gemini_secret not in joined
+        assert "AQ.Ab8RN6SecretToken1234567890" not in joined
+        assert joined.count(REDACTED) >= len(target_loggers) * 2
+    finally:
+        for name, (lvl, prop) in saved_states.items():
+            sub = logging.getLogger(name)
+            sub.setLevel(lvl)
+            sub.propagate = prop
+        root_logger.removeHandler(handler)
+        root_logger.setLevel(old_level)

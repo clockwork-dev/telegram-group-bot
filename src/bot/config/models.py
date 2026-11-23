@@ -133,9 +133,11 @@ class MediaConfig(BaseModel):
 
 
 class TTSConfig(BaseModel):
-    """Text-to-Speech (Edge TTS) synthesis and voice-reply configuration."""
+    """Text-to-Speech (Gemini & Edge TTS) synthesis and voice-reply configuration."""
 
     enabled: bool = True
+    provider: Literal["auto", "gemini", "edge"] = "auto"
+    fallback_to_edge: bool = True
     ru_voice: str = "ru-RU-SvetlanaNeural"
     uk_voice: str = "uk-UA-PolinaNeural"
     rate: str = "+0%"
@@ -143,6 +145,23 @@ class TTSConfig(BaseModel):
     max_chars: int = Field(default=600, ge=50, le=4000)
     timeout_sec: float = Field(default=25.0, gt=0.0)
     reply_voice_to_voice: bool = True
+    gemini_model: str = "gemini-2.5-flash-preview-tts"
+    gemini_ru_voice: str = "Aoede"
+    gemini_uk_voice: str = "Aoede"
+    gemini_style_prompt: str = (
+        "Warm, lively young woman chatting casually with close friends; "
+        "natural conversational cadence with expressive intonation, subtle playful sarcasm, "
+        "and clear Russian/Ukrainian pronunciation—never robotic or announcer-like."
+    )
+    gemini_api_key_env: str = "GEMINI_API_KEY"
+    gemini_api_key: Optional[str] = Field(default=None, repr=False)
+
+    @field_validator("provider", mode="before")
+    @classmethod
+    def _normalize_provider(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
 
 
 class STTConfig(BaseModel):
@@ -209,7 +228,7 @@ class AntigravityProviderConfig(BaseModel):
     data_dir: str = "data/antigravity"
     model: str = "gemini-4-hydrogen"
     effort: Optional[str] = "low"
-    enable_sdk: bool = True
+    enable_sdk: bool = False
     enable_cli_fallback: bool = True
     max_retries: int = Field(default=3, ge=0)
     rate_limit_max_retries: int = Field(default=0, ge=0)
