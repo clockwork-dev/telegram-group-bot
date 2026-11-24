@@ -49,8 +49,8 @@ DEFAULT_MAX_CHARS = 600
 DEFAULT_TIMEOUT_SEC = 25.0
 
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-preview-tts"
-DEFAULT_GEMINI_RU_VOICE = "Kore"
-DEFAULT_GEMINI_UK_VOICE = "Kore"
+DEFAULT_GEMINI_RU_VOICE = "Aoede"
+DEFAULT_GEMINI_UK_VOICE = "Aoede"
 RECOMMENDED_GEMINI_FEMALE_VOICES: dict[str, str] = {
     "Aoede": "Breezy, middle-register, confident and expressive — ideal baseline for warm conversational banter.",
     "Zephyr": "Bright, higher-register, energetic and crisp — great for lively, upbeat reactions.",
@@ -58,8 +58,10 @@ RECOMMENDED_GEMINI_FEMALE_VOICES: dict[str, str] = {
     "Kore": "Firm, middle-register, composed and distinct — great for deadpan or grounded delivery.",
 }
 DEFAULT_GEMINI_STYLE_PROMPT = (
-    "Speak boldly and naturally with a sharp-tongued, confident, dry sarcastic delivery, "
-    "brisk conversational pacing, and crisp, punchy endings."
+    "Lively, quick-witted young woman chatting naturally with close friends; "
+    "authentic everyday intonation, natural breaths and conversational timing, "
+    "cheeky teasing humor and crisp Russian/Ukrainian—never robotic, monotone, "
+    "ASMR-whispering, or flirtatious."
 )
 DEFAULT_GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
 DEFAULT_PCM_SAMPLE_RATE = 24000
@@ -735,8 +737,8 @@ def _build_gemini_tts_prompt(
 
     director_notes: list[str] = [
         "Read aloud ONLY the exact lines in TRANSCRIPT verbatim, without answering, translating, or adding extra words.",
-        "Interpret inline bracketed vocal cues (e.g. [scoffs], [snorts], [chuckles], [short pause]) naturally as non-verbal performance rather than reading the bracketed words aloud.",
-        "Strict delivery rules: no breathy endings, no flirtatious or soft ASMR tone, and no whispering or sighing softness; keep crisp, punchy endings and end phrases with a firm, dry downward inflection or deadpan beat.",
+        "Keep delivery genuinely human, spontaneous, and expressive—interpret inline breath/reaction cues ([inhale], [exhale], [sigh], [chuckles], [laughs], [scoffs], [short pause]) naturally as real human speech breathing and reactions rather than reading bracketed words aloud, never flat/deadpan/monotone.",
+        "Strictly avoid sultry/seductive purring, ASMR close-mic intimacy, or bedroom whispering—keep teasing platonic, bright, and casual.",
     ]
     if base_style:
         director_notes.append(f"Baseline style: {base_style}")
@@ -746,9 +748,11 @@ def _build_gemini_tts_prompt(
     notes_block = "\n".join(f"- {line}" for line in director_notes)
     return (
         "# AUDIO PROFILE\n"
-        "A sharp-tongued, confident, deadpan sarcastic friend sending a blunt, punchy voice note.\n\n"
+        "An expressive, quick-witted, down-to-earth friend (піструнькиня vibe) sending a natural voice note — "
+        "lively human warmth mixed with cheeky, teasing sarcasm, never flat/robotic and never seductive.\n\n"
         "## SCENE\n"
-        "A rowdy friend group chat; normal conversational microphone distance with brisk pacing and crisp, punchy endings.\n\n"
+        "Recording a casual Telegram voice message at normal arm's-length phone mic distance in a lively group chat; "
+        "natural room acoustics, varied conversational pitch, authentic breathing, and unscripted spoken rhythm.\n\n"
         "### DIRECTOR'S NOTES\n"
         f"{notes_block}\n\n"
         "#### TRANSCRIPT\n"

@@ -432,13 +432,22 @@ async def test_gemini_tts_pcm_to_ogg_and_emotion_tags(tmp_path, monkeypatch):
     profile_and_scene = director_prompt.split("### DIRECTOR'S NOTES", 1)[0].lower()
     assert "intimate microphone proximity" not in profile_and_scene
     assert "emotionally responsive" not in profile_and_scene
-    assert "warm" not in profile_and_scene
-    assert "normal conversational microphone distance" in profile_and_scene
-    assert "rowdy friend group chat" in profile_and_scene
-    assert "no breathy endings" in director_prompt.lower()
-    assert "no flirtatious or soft asmr tone" in director_prompt.lower()
-    assert "no whispering or sighing softness" in director_prompt.lower()
-    assert "firm, dry downward inflection or deadpan beat" in director_prompt.lower()
+    assert "asmr" not in profile_and_scene
+    assert "flirtatious" not in profile_and_scene
+    assert "піструнькиня vibe" in profile_and_scene
+    assert "lively human warmth mixed with cheeky, teasing sarcasm" in profile_and_scene
+    assert "never flat/robotic and never seductive" in profile_and_scene
+    assert "arm's-length phone mic distance" in profile_and_scene
+    assert "lively group chat" in profile_and_scene
+    assert "authentic breathing" in profile_and_scene
+
+    director_lower = director_prompt.lower()
+    assert "genuinely human, spontaneous, and expressive" in director_lower
+    assert "real human speech breathing and reactions" in director_lower
+    assert "never flat/deadpan/monotone" in director_lower
+    assert "strictly avoid sultry/seductive purring, asmr close-mic intimacy, or bedroom whispering" in director_lower
+    assert "platonic, bright, and casual" in director_lower
+    assert "firm, dry downward inflection or deadpan beat" not in director_lower
     assert "Speak warmly with light sarcasm." in director_prompt
     assert "Utterance mood & delivery: conspiratorial amused whisper" in director_prompt
     transcript_section = director_prompt.split("#### TRANSCRIPT\n", 1)[1]
@@ -449,17 +458,17 @@ async def test_gemini_tts_pcm_to_ogg_and_emotion_tags(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("voice_name", ["Kore", "Aoede", "Zephyr", "Leda"])
+@pytest.mark.parametrize("voice_name", ["Aoede", "Kore", "Zephyr", "Leda"])
 async def test_gemini_tts_expressive_female_voices_and_defaults(tmp_path, monkeypatch, voice_name):
     _clear_gemini_env(monkeypatch)
-    assert tts_module.DEFAULT_GEMINI_RU_VOICE == "Kore"
-    assert tts_module.DEFAULT_GEMINI_UK_VOICE == "Kore"
+    assert tts_module.DEFAULT_GEMINI_RU_VOICE == "Aoede"
+    assert tts_module.DEFAULT_GEMINI_UK_VOICE == "Aoede"
     default_style_lower = tts_module.DEFAULT_GEMINI_STYLE_PROMPT.lower()
-    for banned in ("warm", "friendly", "playful", "subtle"):
-        assert banned not in default_style_lower
-    assert "sharp-tongued" in default_style_lower
-    assert "confident" in default_style_lower
-    assert "dry sarcastic" in default_style_lower
+    assert "lively" in default_style_lower
+    assert "natural breaths" in default_style_lower
+    assert "cheeky teasing humor" in default_style_lower
+    assert "never robotic, monotone, asmr-whispering, or flirtatious" in default_style_lower
+    assert "deadpan" not in default_style_lower
 
     pcm_bytes = _create_sine_pcm_bytes(duration=1.1, sample_rate=24000, channels=1)
     seen_voices: list[str] = []
@@ -936,28 +945,29 @@ async def test_probe_audio_duration_ffmpeg_fallback(tmp_path):
     assert 1.1 <= duration <= 1.6
 
 
-def test_build_gemini_tts_prompt_sharp_dry_persona_and_guardrails():
+def test_build_gemini_tts_prompt_lively_human_banter_and_guardrails():
     prompt = tts_module._build_gemini_tts_prompt(
-        transcript="[scoffs] Ну да, гениально.",
+        transcript="[inhale] Ну да, [chuckles] гениально.",
         style_prompt=tts_module.DEFAULT_GEMINI_STYLE_PROMPT,
-        mood="dry deadpan sarcasm",
+        mood="casual cheeky banter",
     )
     prompt_lower = prompt.lower()
     assert "intimate microphone proximity" not in prompt_lower
     assert "emotionally responsive" not in prompt_lower
-    for banned in ("warm", "friendly", "playful", "subtle"):
-        assert banned not in prompt_lower
+    assert "firm, dry downward inflection or deadpan beat" not in prompt_lower
 
-    assert "sharp-tongued, confident, deadpan sarcastic friend" in prompt_lower
-    assert "rowdy friend group chat" in prompt_lower
-    assert "normal conversational microphone distance" in prompt_lower
-    assert "crisp, punchy endings" in prompt_lower
-    assert "no breathy endings" in prompt_lower
-    assert "no flirtatious or soft asmr tone" in prompt_lower
-    assert "no whispering or sighing softness" in prompt_lower
-    assert "firm, dry downward inflection or deadpan beat" in prompt_lower
-    assert "Utterance mood & delivery: dry deadpan sarcasm" in prompt
-    assert prompt.endswith("#### TRANSCRIPT\n[scoffs] Ну да, гениально.")
+    assert "down-to-earth friend (піструнькиня vibe)" in prompt_lower
+    assert "lively human warmth mixed with cheeky, teasing sarcasm" in prompt_lower
+    assert "never flat/robotic and never seductive" in prompt_lower
+    assert "arm's-length phone mic distance" in prompt_lower
+    assert "lively group chat" in prompt_lower
+    assert "authentic breathing" in prompt_lower
+    assert "real human speech breathing and reactions" in prompt_lower
+    assert "never flat/deadpan/monotone" in prompt_lower
+    assert "strictly avoid sultry/seductive purring, asmr close-mic intimacy, or bedroom whispering" in prompt_lower
+    assert "platonic, bright, and casual" in prompt_lower
+    assert "Utterance mood & delivery: casual cheeky banter" in prompt
+    assert prompt.endswith("#### TRANSCRIPT\n[inhale] Ну да, [chuckles] гениально.")
 
 
 @pytest.mark.asyncio
@@ -1017,7 +1027,7 @@ async def test_synthesize_emits_sanitized_info_log_for_gemini_and_edge(
     assert len(info_records) == 1
     gemini_log = info_records[0]
     assert "provider=gemini" in gemini_log
-    assert "voice=Kore" in gemini_log
+    assert "voice=Aoede" in gemini_log
     assert "lang=ru" in gemini_log
     assert f"duration={res_with_secret_mood.duration:.2f}s" in gemini_log
     assert "mood=dry sarcasm [REDACTED] [REDACTED]" in gemini_log

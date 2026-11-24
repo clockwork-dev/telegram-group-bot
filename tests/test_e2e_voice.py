@@ -244,26 +244,26 @@ async def test_e2e_voice_ru_mention_in_audio_to_voice_reply(tmp_path: Path, monk
     assert "ГОЛОСОВОЙ ОТВЕТ" in prompt_used
     assert "[MOOD:" in prompt_used
     for mood_example in (
-        "[MOOD: dry deadpan sarcasm]",
-        "[MOOD: bold, teasing smirk]",
-        "[MOOD: unimpressed, biting tone]",
-        "[MOOD: annoyed eye-roll, brisk pace]",
-        "[MOOD: smug and mocking]",
+        "[MOOD: casual cheeky banter]",
+        "[MOOD: amused eye-roll, lively]",
+        "[MOOD: candid, slightly exasperated]",
+        "[MOOD: teasing laugh, natural pace]",
+        "[MOOD: friendly sarcastic roast]",
     ):
         assert mood_example in prompt_used
-    for vocal_tag in ("[scoffs]", "[snorts]", "[chuckles]", "[short pause]"):
+    for vocal_tag in ("[inhale]", "[exhale]", "[sigh]", "[chuckles]", "[laughs]", "[scoffs]", "[short pause]"):
         assert vocal_tag in prompt_used
-    assert "—" in prompt_used
-    assert "ЗАПРЕЩЕНО использовать многоточия `...`" in prompt_used
-    for forbidden_cue in (
-        "[whispers]",
-        "[sigh]",
-        "playful sarcasm",
-        "amused sigh",
+    assert "1–2 живые устные фразы" in prompt_used
+    assert "ЗАПРЕЩЕНО: `[whispers]`" in prompt_used
+    for old_cue in (
+        "dry deadpan sarcasm",
+        "bold, teasing smirk",
+        "unimpressed, biting tone",
+        "smug and mocking",
         "conspiratorial whisper",
         "warm and excited",
     ):
-        assert forbidden_cue not in prompt_used
+        assert old_cue not in prompt_used
 
     userbot.send_voice.assert_awaited_once()
     userbot.send_reply.assert_not_awaited()
@@ -648,8 +648,8 @@ async def test_e2e_voice_tts_hot_reload_propagates_gemini_fields_and_secrets(
         assert orchestrator.tts_synthesizer.provider == "auto"
         assert orchestrator.tts_synthesizer.fallback_to_edge is True
         assert orchestrator.tts_synthesizer.gemini_model == "gemini-2.5-flash-preview-tts"
-        assert orchestrator.tts_synthesizer.gemini_ru_voice == "Kore"
-        assert orchestrator.tts_synthesizer.gemini_uk_voice == "Kore"
+        assert orchestrator.tts_synthesizer.gemini_ru_voice == "Aoede"
+        assert orchestrator.tts_synthesizer.gemini_uk_voice == "Aoede"
         assert orchestrator.tts_synthesizer.gemini_api_key_env == "GEMINI_API_KEY"
 
         custom_key = "AIzaSyHotReloadCustomKey1234567890abcdef"
@@ -664,9 +664,9 @@ async def test_e2e_voice_tts_hot_reload_propagates_gemini_fields_and_secrets(
                 "max_chars": 420,
                 "timeout_sec": 12.5,
                 "gemini_model": "gemini-2.5-pro-preview-tts",
-                "gemini_ru_voice": "Aoede",
+                "gemini_ru_voice": "Kore",
                 "gemini_uk_voice": "Zephyr",
-                "gemini_style_prompt": "Dry sarcastic tone with clear diction.",
+                "gemini_style_prompt": "Lively conversational tone with clear diction.",
                 "gemini_api_key_env": "CUSTOM_GEMINI_TTS_TOKEN_VAR",
             }
         )
@@ -682,9 +682,9 @@ async def test_e2e_voice_tts_hot_reload_propagates_gemini_fields_and_secrets(
         assert tts.max_chars == 420
         assert tts.timeout_sec == 12.5
         assert tts.gemini_model == "gemini-2.5-pro-preview-tts"
-        assert tts.gemini_ru_voice == "Aoede"
+        assert tts.gemini_ru_voice == "Kore"
         assert tts.gemini_uk_voice == "Zephyr"
-        assert tts.gemini_style_prompt == "Dry sarcastic tone with clear diction."
+        assert tts.gemini_style_prompt == "Lively conversational tone with clear diction."
         assert tts.gemini_api_key_env == "CUSTOM_GEMINI_TTS_TOKEN_VAR"
 
         # Custom env secret and AIza... Google API key pattern must be masked
@@ -917,10 +917,10 @@ async def test_e2e_voice_success_keeps_tags_for_tts_but_strips_mood_and_tags_fro
 
 
 @pytest.mark.asyncio
-async def test_build_context_prompt_voice_reply_mode_and_system_prompt_sharp_sarcastic_guidance(
+async def test_build_context_prompt_voice_reply_mode_and_system_prompt_conversational_guidance(
     tmp_path: Path,
 ) -> None:
-    """build_context_prompt(voice_reply_mode=True) and config/system_prompt.md enforce sharp deadpan TTS cues."""
+    """build_context_prompt(voice_reply_mode=True) and config/system_prompt.md align on lively spoken guidance."""
     cfg_dir = _copy_test_config(tmp_path)
     config_mgr = ConfigManager(config_dir=cfg_dir)
     chat_id = int(config_mgr.bot.telegram.allowed_chat_ids[0])
@@ -967,18 +967,35 @@ async def test_build_context_prompt_voice_reply_mode_and_system_prompt_sharp_sar
         sys_prompt = Path("config/system_prompt.md").read_text(encoding="utf-8")
 
         expected_moods = (
-            "[MOOD: dry deadpan sarcasm]",
-            "[MOOD: bold, teasing smirk]",
-            "[MOOD: unimpressed, biting tone]",
-            "[MOOD: annoyed eye-roll, brisk pace]",
-            "[MOOD: smug and mocking]",
+            "[MOOD: casual cheeky banter]",
+            "[MOOD: amused eye-roll, lively]",
+            "[MOOD: candid, slightly exasperated]",
+            "[MOOD: teasing laugh, natural pace]",
+            "[MOOD: friendly sarcastic roast]",
         )
-        expected_tags = ("[scoffs]", "[snorts]", "[chuckles]", "[short pause]")
-        forbidden_cues = (
-            "[whispers]",
+        expected_tags = (
+            "[inhale]",
+            "[exhale]",
             "[sigh]",
-            "playful sarcasm",
-            "amused sigh",
+            "[chuckles]",
+            "[laughs]",
+            "[scoffs]",
+            "[short pause]",
+        )
+        expected_phrases = (
+            "1–2 живые устные фразы, как реальный человек наговаривает голосовое в чате",
+            "без книжных метафор и канцелярита",
+            "`ну`, `слушай`, `короче`, `типа`, `блин`, `та ладно`, `ага`",
+            "только как короткая живая заминка в середине мысли, не томный шёпот",
+            "ЗАПРЕЩЕНО: `[whispers]`, томный/флиртующий/соблазнительный тон",
+            "книжные или монотонно-литературные формулировки",
+            "Markdown-разметка, таблицы, списки, блоки кода и URL-ссылки",
+        )
+        old_cues = (
+            "dry deadpan sarcasm",
+            "bold, teasing smirk",
+            "unimpressed, biting tone",
+            "smug and mocking",
             "conspiratorial whisper",
             "warm and excited",
         )
@@ -989,9 +1006,9 @@ async def test_build_context_prompt_voice_reply_mode_and_system_prompt_sharp_sar
                 assert mood in target_text
             for tag in expected_tags:
                 assert tag in target_text
-            assert "—" in target_text
-            assert "ЗАПРЕЩЕНО использовать многоточия `...`" in target_text
-            for cue in forbidden_cues:
+            for phrase in expected_phrases:
+                assert phrase in target_text
+            for cue in old_cues:
                 assert cue not in target_text
     finally:
         await orchestrator.stop()
