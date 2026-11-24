@@ -146,12 +146,12 @@ class TTSConfig(BaseModel):
     timeout_sec: float = Field(default=25.0, gt=0.0)
     reply_voice_to_voice: bool = True
     gemini_model: str = "gemini-2.5-flash-preview-tts"
-    gemini_ru_voice: str = "Aoede"
-    gemini_uk_voice: str = "Aoede"
+    gemini_ru_voice: str = "Kore"
+    gemini_uk_voice: str = "Kore"
     gemini_style_prompt: str = (
-        "Warm, lively young woman chatting casually with close friends; "
-        "natural conversational cadence with expressive intonation, subtle playful sarcasm, "
-        "and clear Russian/Ukrainian pronunciation—never robotic or announcer-like."
+        "Sharp-tongued, confident young woman roasting friends in a group chat; "
+        "bold, dry deadpan sarcasm and biting humor with crisp, punchy "
+        "Russian/Ukrainian delivery—never sweet, breathy, flirtatious, or announcer-like."
     )
     gemini_api_key_env: str = "GEMINI_API_KEY"
     gemini_api_key: Optional[str] = Field(default=None, repr=False)

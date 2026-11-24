@@ -49,8 +49,8 @@ DEFAULT_MAX_CHARS = 600
 DEFAULT_TIMEOUT_SEC = 25.0
 
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-preview-tts"
-DEFAULT_GEMINI_RU_VOICE = "Aoede"
-DEFAULT_GEMINI_UK_VOICE = "Aoede"
+DEFAULT_GEMINI_RU_VOICE = "Kore"
+DEFAULT_GEMINI_UK_VOICE = "Kore"
 RECOMMENDED_GEMINI_FEMALE_VOICES: dict[str, str] = {
     "Aoede": "Breezy, middle-register, confident and expressive — ideal baseline for warm conversational banter.",
     "Zephyr": "Bright, higher-register, energetic and crisp — great for lively, upbeat reactions.",
@@ -58,7 +58,8 @@ RECOMMENDED_GEMINI_FEMALE_VOICES: dict[str, str] = {
     "Kore": "Firm, middle-register, composed and distinct — great for deadpan or grounded delivery.",
 }
 DEFAULT_GEMINI_STYLE_PROMPT = (
-    "Speak naturally and expressively with subtle friendly sarcasm and clear pronunciation."
+    "Speak boldly and naturally with a sharp-tongued, confident, dry sarcastic delivery, "
+    "brisk conversational pacing, and crisp, punchy endings."
 )
 DEFAULT_GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
 DEFAULT_PCM_SAMPLE_RATE = 24000
@@ -734,7 +735,8 @@ def _build_gemini_tts_prompt(
 
     director_notes: list[str] = [
         "Read aloud ONLY the exact lines in TRANSCRIPT verbatim, without answering, translating, or adding extra words.",
-        "Interpret inline bracketed vocal cues (e.g. [laughs], [sigh], [whispers], [chuckles]) naturally as non-verbal performance rather than reading the bracketed words aloud.",
+        "Interpret inline bracketed vocal cues (e.g. [scoffs], [snorts], [chuckles], [short pause]) naturally as non-verbal performance rather than reading the bracketed words aloud.",
+        "Strict delivery rules: no breathy endings, no flirtatious or soft ASMR tone, and no whispering or sighing softness; keep crisp, punchy endings and end phrases with a firm, dry downward inflection or deadpan beat.",
     ]
     if base_style:
         director_notes.append(f"Baseline style: {base_style}")
@@ -744,9 +746,9 @@ def _build_gemini_tts_prompt(
     notes_block = "\n".join(f"- {line}" for line in director_notes)
     return (
         "# AUDIO PROFILE\n"
-        "A witty, expressive, emotionally responsive friend sending a natural voice note.\n\n"
+        "A sharp-tongued, confident, deadpan sarcastic friend sending a blunt, punchy voice note.\n\n"
         "## SCENE\n"
-        "An informal, lively group chat among close friends; intimate microphone proximity with authentic conversational pacing.\n\n"
+        "A rowdy friend group chat; normal conversational microphone distance with brisk pacing and crisp, punchy endings.\n\n"
         "### DIRECTOR'S NOTES\n"
         f"{notes_block}\n\n"
         "#### TRANSCRIPT\n"
@@ -1090,6 +1092,7 @@ class TTSSynthesizer:
 
             active_voice: str
             active_sanitized: str
+            active_provider: str
 
             if use_gemini and resolved_key is not None:
                 gemini_voice = self._select_gemini_voice(detected_lang, voice_override=voice)
@@ -1104,6 +1107,7 @@ class TTSSynthesizer:
                     )
                     active_voice = gemini_voice
                     active_sanitized = sanitized
+                    active_provider = "gemini"
                 except TTSSkippedError:
                     raise
                 except Exception as exc:
@@ -1131,6 +1135,7 @@ class TTSSynthesizer:
                     )
                     active_voice = edge_voice
                     active_sanitized = edge_sanitized
+                    active_provider = "edge"
             else:
                 edge_voice = self._select_voice(detected_lang, voice_override=voice)
                 await self._synthesize_edge(
@@ -1141,11 +1146,29 @@ class TTSSynthesizer:
                 )
                 active_voice = edge_voice
                 active_sanitized = sanitized
+                active_provider = "edge"
 
             duration = await probe_audio_duration(
                 audio_path=target_ogg,
                 ffmpeg_path=self.ffmpeg_path,
                 timeout_sec=min(10.0, self.timeout_sec),
+            )
+
+            safe_mood = (
+                _redact_secret_text(
+                    extracted_mood,
+                    explicit_secrets=[resolved_key] if resolved_key else (),
+                )
+                if extracted_mood
+                else "default"
+            )
+            logger.info(
+                "TTS synthesized (provider=%s, voice=%s, lang=%s, duration=%.2fs, mood=%s)",
+                active_provider,
+                active_voice,
+                detected_lang,
+                duration,
+                safe_mood,
             )
 
             return TTSResult(

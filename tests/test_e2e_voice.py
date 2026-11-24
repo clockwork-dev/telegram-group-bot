@@ -243,8 +243,27 @@ async def test_e2e_voice_ru_mention_in_audio_to_voice_reply(tmp_path: Path, monk
     assert "серверный билд" in prompt_used
     assert "ГОЛОСОВОЙ ОТВЕТ" in prompt_used
     assert "[MOOD:" in prompt_used
-    for vocal_tag in ("[sigh]", "[chuckles]", "[laughs]", "[whispers]", "[excitement]"):
+    for mood_example in (
+        "[MOOD: dry deadpan sarcasm]",
+        "[MOOD: bold, teasing smirk]",
+        "[MOOD: unimpressed, biting tone]",
+        "[MOOD: annoyed eye-roll, brisk pace]",
+        "[MOOD: smug and mocking]",
+    ):
+        assert mood_example in prompt_used
+    for vocal_tag in ("[scoffs]", "[snorts]", "[chuckles]", "[short pause]"):
         assert vocal_tag in prompt_used
+    assert "—" in prompt_used
+    assert "ЗАПРЕЩЕНО использовать многоточия `...`" in prompt_used
+    for forbidden_cue in (
+        "[whispers]",
+        "[sigh]",
+        "playful sarcasm",
+        "amused sigh",
+        "conspiratorial whisper",
+        "warm and excited",
+    ):
+        assert forbidden_cue not in prompt_used
 
     userbot.send_voice.assert_awaited_once()
     userbot.send_reply.assert_not_awaited()
@@ -629,8 +648,8 @@ async def test_e2e_voice_tts_hot_reload_propagates_gemini_fields_and_secrets(
         assert orchestrator.tts_synthesizer.provider == "auto"
         assert orchestrator.tts_synthesizer.fallback_to_edge is True
         assert orchestrator.tts_synthesizer.gemini_model == "gemini-2.5-flash-preview-tts"
-        assert orchestrator.tts_synthesizer.gemini_ru_voice == "Aoede"
-        assert orchestrator.tts_synthesizer.gemini_uk_voice == "Aoede"
+        assert orchestrator.tts_synthesizer.gemini_ru_voice == "Kore"
+        assert orchestrator.tts_synthesizer.gemini_uk_voice == "Kore"
         assert orchestrator.tts_synthesizer.gemini_api_key_env == "GEMINI_API_KEY"
 
         custom_key = "AIzaSyHotReloadCustomKey1234567890abcdef"
@@ -645,7 +664,7 @@ async def test_e2e_voice_tts_hot_reload_propagates_gemini_fields_and_secrets(
                 "max_chars": 420,
                 "timeout_sec": 12.5,
                 "gemini_model": "gemini-2.5-pro-preview-tts",
-                "gemini_ru_voice": "Kore",
+                "gemini_ru_voice": "Aoede",
                 "gemini_uk_voice": "Zephyr",
                 "gemini_style_prompt": "Dry sarcastic tone with clear diction.",
                 "gemini_api_key_env": "CUSTOM_GEMINI_TTS_TOKEN_VAR",
@@ -663,7 +682,7 @@ async def test_e2e_voice_tts_hot_reload_propagates_gemini_fields_and_secrets(
         assert tts.max_chars == 420
         assert tts.timeout_sec == 12.5
         assert tts.gemini_model == "gemini-2.5-pro-preview-tts"
-        assert tts.gemini_ru_voice == "Kore"
+        assert tts.gemini_ru_voice == "Aoede"
         assert tts.gemini_uk_voice == "Zephyr"
         assert tts.gemini_style_prompt == "Dry sarcastic tone with clear diction."
         assert tts.gemini_api_key_env == "CUSTOM_GEMINI_TTS_TOKEN_VAR"
@@ -893,5 +912,86 @@ async def test_e2e_voice_success_keeps_tags_for_tts_but_strips_mood_and_tags_fro
         assert "[MOOD:" not in (bot_msgs[0].text or "")
         assert "[sigh]" not in (bot_msgs[0].text or "")
         assert "[laughs softly]" not in (bot_msgs[0].text or "")
+    finally:
+        await orchestrator.stop()
+
+
+@pytest.mark.asyncio
+async def test_build_context_prompt_voice_reply_mode_and_system_prompt_sharp_sarcastic_guidance(
+    tmp_path: Path,
+) -> None:
+    """build_context_prompt(voice_reply_mode=True) and config/system_prompt.md enforce sharp deadpan TTS cues."""
+    cfg_dir = _copy_test_config(tmp_path)
+    config_mgr = ConfigManager(config_dir=cfg_dir)
+    chat_id = int(config_mgr.bot.telegram.allowed_chat_ids[0])
+    memory_store = MemoryStore(db_path=str(tmp_path / "voice_prompt_guidance.sqlite"))
+    await memory_store.init_db()
+
+    mock_provider = MagicMock()
+    mock_provider.generate_response = AsyncMock()
+    userbot = _build_mock_userbot()
+    orchestrator = GroupBotOrchestrator(
+        config_mgr=config_mgr,
+        memory_store=memory_store,
+        provider=mock_provider,
+        userbot=userbot,
+    )
+
+    try:
+        ogg_in = _write_test_ogg(tmp_path / "in_prompt_check.ogg")
+        incoming = _make_voice_incoming(
+            chat_id=chat_id,
+            msg_id=901,
+            sender_id=447164588,
+            sender_name="Анюта",
+            ogg_path=ogg_in,
+            caption="Ну что там с тестами?",
+        )
+
+        prompt_text = orchestrator.build_context_prompt(
+            incoming=incoming,
+            recent_history=[],
+            facts=[],
+            friend_profile=None,
+            voice_reply_mode=False,
+        )
+        assert "ГОЛОСОВОЙ ОТВЕТ" not in prompt_text
+
+        prompt_voice = orchestrator.build_context_prompt(
+            incoming=incoming,
+            recent_history=[],
+            facts=[],
+            friend_profile=None,
+            voice_reply_mode=True,
+        )
+        sys_prompt = Path("config/system_prompt.md").read_text(encoding="utf-8")
+
+        expected_moods = (
+            "[MOOD: dry deadpan sarcasm]",
+            "[MOOD: bold, teasing smirk]",
+            "[MOOD: unimpressed, biting tone]",
+            "[MOOD: annoyed eye-roll, brisk pace]",
+            "[MOOD: smug and mocking]",
+        )
+        expected_tags = ("[scoffs]", "[snorts]", "[chuckles]", "[short pause]")
+        forbidden_cues = (
+            "[whispers]",
+            "[sigh]",
+            "playful sarcasm",
+            "amused sigh",
+            "conspiratorial whisper",
+            "warm and excited",
+        )
+
+        for target_text in (prompt_voice, sys_prompt):
+            assert "ГОЛОСОВОЙ ОТВЕТ" in target_text
+            for mood in expected_moods:
+                assert mood in target_text
+            for tag in expected_tags:
+                assert tag in target_text
+            assert "—" in target_text
+            assert "ЗАПРЕЩЕНО использовать многоточия `...`" in target_text
+            for cue in forbidden_cues:
+                assert cue not in target_text
     finally:
         await orchestrator.stop()

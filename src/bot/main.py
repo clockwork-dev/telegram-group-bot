@@ -1017,11 +1017,12 @@ class GroupBotOrchestrator:
                 "\nГОЛОСОВОЙ ОТВЕТ: собеседник отправил голосовое сообщение, твой ответ будет озвучен голосом (TTS). "
                 "Начни ответ с короткой директивы настроения под момент в формате "
                 "`[MOOD: <2-6 English words describing emotion/pace>]` "
-                "(например: `[MOOD: playful sarcasm]`, `[MOOD: amused sigh]`, "
-                "`[MOOD: conspiratorial whisper]`, `[MOOD: annoyed, fast pace]`, `[MOOD: warm and excited]`). "
-                "Далее пиши 1-2 короткие разговорные фразы, как говорят вслух, "
-                "уместно вплетая естественные вокальные теги (`[sigh]`, `[chuckles]`, `[laughs]`, "
-                "`[whispers]`, `[excitement]`, `[short pause]`) и многоточия `...`. "
+                "(например: `[MOOD: dry deadpan sarcasm]`, `[MOOD: bold, teasing smirk]`, "
+                "`[MOOD: unimpressed, biting tone]`, `[MOOD: annoyed eye-roll, brisk pace]`, "
+                "`[MOOD: smug and mocking]`). "
+                "Далее пиши 1-2 короткие, хлёсткие разговорные фразы с тире `—` для ритма и твёрдой концовкой, "
+                "уместно вплетая резкие вокальные теги (`[scoffs]`, `[snorts]`, изредка `[chuckles]`, `[short pause]`). "
+                "ЗАПРЕЩЕНО использовать многоточия `...`, шёпот или томные вздохи — фраза не должна обрываться с придыханием. "
                 "БЕЗ Markdown-разметки, БЕЗ таблиц, списков, блоков кода и URL-ссылок."
             )
         if ops_tools_enabled:

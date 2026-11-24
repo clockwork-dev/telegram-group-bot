@@ -148,7 +148,7 @@ def test_extract_tts_mood_and_text_and_package_exports():
     assert pkg_extract_tts_mood_and_text is extract_tts_mood_and_text
     assert pkg_strip_tts_emotion_tags is strip_tts_emotion_tags
     assert pkg_recommended_voices is RECOMMENDED_GEMINI_FEMALE_VOICES
-    assert {"Aoede", "Zephyr", "Leda"}.issubset(RECOMMENDED_GEMINI_FEMALE_VOICES)
+    assert {"Kore", "Aoede", "Zephyr", "Leda"}.issubset(RECOMMENDED_GEMINI_FEMALE_VOICES)
 
     mood, body = extract_tts_mood_and_text(
         "[MOOD: warm playful sarcasm]\n[laughs softly] Ну да, [whispers] конечно!"
@@ -429,6 +429,16 @@ async def test_gemini_tts_pcm_to_ogg_and_emotion_tags(tmp_path, monkeypatch):
     assert "## SCENE" in director_prompt
     assert "### DIRECTOR'S NOTES" in director_prompt
     assert "#### TRANSCRIPT" in director_prompt
+    profile_and_scene = director_prompt.split("### DIRECTOR'S NOTES", 1)[0].lower()
+    assert "intimate microphone proximity" not in profile_and_scene
+    assert "emotionally responsive" not in profile_and_scene
+    assert "warm" not in profile_and_scene
+    assert "normal conversational microphone distance" in profile_and_scene
+    assert "rowdy friend group chat" in profile_and_scene
+    assert "no breathy endings" in director_prompt.lower()
+    assert "no flirtatious or soft asmr tone" in director_prompt.lower()
+    assert "no whispering or sighing softness" in director_prompt.lower()
+    assert "firm, dry downward inflection or deadpan beat" in director_prompt.lower()
     assert "Speak warmly with light sarcasm." in director_prompt
     assert "Utterance mood & delivery: conspiratorial amused whisper" in director_prompt
     transcript_section = director_prompt.split("#### TRANSCRIPT\n", 1)[1]
@@ -439,11 +449,17 @@ async def test_gemini_tts_pcm_to_ogg_and_emotion_tags(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("voice_name", ["Aoede", "Zephyr", "Leda"])
+@pytest.mark.parametrize("voice_name", ["Kore", "Aoede", "Zephyr", "Leda"])
 async def test_gemini_tts_expressive_female_voices_and_defaults(tmp_path, monkeypatch, voice_name):
     _clear_gemini_env(monkeypatch)
-    assert tts_module.DEFAULT_GEMINI_RU_VOICE == "Aoede"
-    assert tts_module.DEFAULT_GEMINI_UK_VOICE == "Aoede"
+    assert tts_module.DEFAULT_GEMINI_RU_VOICE == "Kore"
+    assert tts_module.DEFAULT_GEMINI_UK_VOICE == "Kore"
+    default_style_lower = tts_module.DEFAULT_GEMINI_STYLE_PROMPT.lower()
+    for banned in ("warm", "friendly", "playful", "subtle"):
+        assert banned not in default_style_lower
+    assert "sharp-tongued" in default_style_lower
+    assert "confident" in default_style_lower
+    assert "dry sarcastic" in default_style_lower
 
     pcm_bytes = _create_sine_pcm_bytes(duration=1.1, sample_rate=24000, channels=1)
     seen_voices: list[str] = []
@@ -918,3 +934,136 @@ async def test_probe_audio_duration_ffmpeg_fallback(tmp_path):
         duration = await probe_audio_duration(wav_file)
 
     assert 1.1 <= duration <= 1.6
+
+
+def test_build_gemini_tts_prompt_sharp_dry_persona_and_guardrails():
+    prompt = tts_module._build_gemini_tts_prompt(
+        transcript="[scoffs] Ну да, гениально.",
+        style_prompt=tts_module.DEFAULT_GEMINI_STYLE_PROMPT,
+        mood="dry deadpan sarcasm",
+    )
+    prompt_lower = prompt.lower()
+    assert "intimate microphone proximity" not in prompt_lower
+    assert "emotionally responsive" not in prompt_lower
+    for banned in ("warm", "friendly", "playful", "subtle"):
+        assert banned not in prompt_lower
+
+    assert "sharp-tongued, confident, deadpan sarcastic friend" in prompt_lower
+    assert "rowdy friend group chat" in prompt_lower
+    assert "normal conversational microphone distance" in prompt_lower
+    assert "crisp, punchy endings" in prompt_lower
+    assert "no breathy endings" in prompt_lower
+    assert "no flirtatious or soft asmr tone" in prompt_lower
+    assert "no whispering or sighing softness" in prompt_lower
+    assert "firm, dry downward inflection or deadpan beat" in prompt_lower
+    assert "Utterance mood & delivery: dry deadpan sarcasm" in prompt
+    assert prompt.endswith("#### TRANSCRIPT\n[scoffs] Ну да, гениально.")
+
+
+@pytest.mark.asyncio
+async def test_synthesize_emits_sanitized_info_log_for_gemini_and_edge(
+    tmp_path, monkeypatch, caplog
+):
+    _clear_gemini_env(monkeypatch)
+    gemini_secret = "AIzaSecretMoodLeakCheck123456789012345"
+    custom_secret = "custom-non-aiza-tts-secret-0987654321"
+    pcm_bytes = _create_sine_pcm_bytes(duration=1.2, sample_rate=24000, channels=1)
+
+    class FakeModels:
+        def generate_content(self, *, model, contents, config):
+            return SimpleNamespace(
+                candidates=[
+                    SimpleNamespace(
+                        content=SimpleNamespace(
+                            parts=[
+                                SimpleNamespace(
+                                    inline_data=SimpleNamespace(
+                                        data=pcm_bytes,
+                                        mime_type="audio/L16;codec=pcm;rate=24000",
+                                    )
+                                )
+                            ]
+                        )
+                    )
+                ]
+            )
+
+    class FakeClient:
+        def __init__(self, *, api_key: str, http_options=None):
+            self.aio = None
+            self.models = FakeModels()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(tts_module, "genai", SimpleNamespace(Client=FakeClient))
+    synth_gemini = TTSSynthesizer(
+        provider="gemini",
+        gemini_api_key=custom_secret,
+        temp_dir_base=str(tmp_path / "log_gemini"),
+    )
+
+    secret_transcript = "Секретная фраза для проверки утечки в логах."
+    with caplog.at_level(logging.INFO, logger="bot.media.tts"):
+        res_with_secret_mood = await synth_gemini.synthesize(
+            f"[MOOD: dry sarcasm {gemini_secret} {custom_secret}] {secret_transcript}"
+        )
+
+    info_records = [
+        rec.getMessage()
+        for rec in caplog.records
+        if rec.name == "bot.media.tts" and rec.levelno == logging.INFO
+    ]
+    assert len(info_records) == 1
+    gemini_log = info_records[0]
+    assert "provider=gemini" in gemini_log
+    assert "voice=Kore" in gemini_log
+    assert "lang=ru" in gemini_log
+    assert f"duration={res_with_secret_mood.duration:.2f}s" in gemini_log
+    assert "mood=dry sarcasm [REDACTED] [REDACTED]" in gemini_log
+    assert gemini_secret not in gemini_log
+    assert custom_secret not in gemini_log
+    assert secret_transcript not in gemini_log
+    if res_with_secret_mood.temp_dir is not None:
+        import shutil
+
+        shutil.rmtree(res_with_secret_mood.temp_dir, ignore_errors=True)
+
+    # Default mood ("default") + Edge provider logging without raw transcript text
+    caplog.clear()
+    sample_wav = tmp_path / "edge_log.wav"
+    _create_sine_wav(sample_wav, duration=1.2)
+
+    class FakeCommunicate:
+        def __init__(self, text: str, voice: str, rate: str = "+0%", pitch: str = "+0Hz"):
+            pass
+
+        async def save(self, filename: str) -> None:
+            Path(filename).write_bytes(sample_wav.read_bytes())
+
+    monkeypatch.setattr(tts_module, "edge_tts", SimpleNamespace(Communicate=FakeCommunicate))
+    synth_edge = TTSSynthesizer(
+        provider="edge",
+        temp_dir_base=str(tmp_path / "log_edge"),
+    )
+    edge_transcript = "Привіт, це приватний текст без настрою!"
+    with caplog.at_level(logging.INFO, logger="bot.media.tts"):
+        res_edge = await synth_edge.synthesize(edge_transcript)
+
+    edge_logs = [
+        rec.getMessage()
+        for rec in caplog.records
+        if rec.name == "bot.media.tts" and rec.levelno == logging.INFO
+    ]
+    assert len(edge_logs) == 1
+    edge_log = edge_logs[0]
+    assert "provider=edge" in edge_log
+    assert f"voice={tts_module.DEFAULT_UK_VOICE}" in edge_log
+    assert "lang=uk" in edge_log
+    assert f"duration={res_edge.duration:.2f}s" in edge_log
+    assert "mood=default" in edge_log
+    assert edge_transcript not in edge_log
+    if res_edge.temp_dir is not None:
+        import shutil
+
+        shutil.rmtree(res_edge.temp_dir, ignore_errors=True)
