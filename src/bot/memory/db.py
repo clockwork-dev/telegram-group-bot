@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set
 
-from bot.memory.fts import FactRecord, FTSStore, build_archive_fts_query
+from bot.memory.fts import _UNSET, FactRecord, FTSStore, build_archive_fts_query
 
 
 @dataclass
@@ -423,21 +423,89 @@ class MemoryStore:
         async with self._lock:
             await asyncio.to_thread(self._sync_mark_compacted, message_ids)
 
+    def _sync_search_facts(
+        self,
+        query: str,
+        limit: int = 5,
+        exclude_fact_ids: Optional[Sequence[int]] = None,
+        *,
+        chat_id: Optional[int] = None,
+        author_user_id: Optional[int] = None,
+        target_user_ids: Optional[Sequence[int]] = None,
+        query_vector: Optional[Any] = None,
+        embedding_model: Optional[str] = None,
+        min_vector_similarity: float = 0.52,
+        now_ts: Optional[int] = None,
+    ) -> List[FactRecord]:
+        with self._sync_lock:
+            conn = self._get_connection()
+            return FTSStore.search_facts(
+                conn,
+                query,
+                limit,
+                exclude_fact_ids,
+                chat_id=chat_id,
+                author_user_id=author_user_id,
+                target_user_ids=target_user_ids,
+                query_vector=query_vector,
+                embedding_model=embedding_model,
+                min_vector_similarity=min_vector_similarity,
+                now_ts=now_ts,
+            )
+
     async def search_facts(
         self,
         query: str,
         limit: int = 5,
         exclude_fact_ids: Optional[Sequence[int]] = None,
+        *,
+        chat_id: Optional[int] = None,
+        author_user_id: Optional[int] = None,
+        target_user_ids: Optional[Sequence[int]] = None,
+        query_vector: Optional[Any] = None,
+        embedding_model: Optional[str] = None,
+        min_vector_similarity: float = 0.52,
+        now_ts: Optional[int] = None,
     ) -> List[FactRecord]:
-        """Search long-term facts using Russian prefix full-text search."""
+        """Search active long-term facts via chat-scoped hybrid FTS5 + vector RRF."""
         async with self._lock:
-            conn = self._get_connection()
             return await asyncio.to_thread(
-                FTSStore.search_facts,
-                conn,
+                self._sync_search_facts,
                 query,
                 limit,
                 exclude_fact_ids,
+                chat_id=chat_id,
+                author_user_id=author_user_id,
+                target_user_ids=target_user_ids,
+                query_vector=query_vector,
+                embedding_model=embedding_model,
+                min_vector_similarity=min_vector_similarity,
+                now_ts=now_ts,
+            )
+
+    def _sync_add_fact(
+        self,
+        subject: str,
+        fact: str,
+        category: str,
+        source_chat_id: Optional[int] = None,
+        created_at: Optional[int] = None,
+        subject_user_id: Optional[int] = None,
+        status: str = "active",
+        expires_at: Optional[int] = None,
+    ) -> int:
+        with self._sync_lock:
+            conn = self._get_connection()
+            return FTSStore.add_fact(
+                conn,
+                subject,
+                fact,
+                category,
+                source_chat_id,
+                created_at,
+                subject_user_id,
+                status,
+                expires_at,
             )
 
     async def add_fact(
@@ -446,19 +514,293 @@ class MemoryStore:
         fact: str,
         category: str,
         source_chat_id: Optional[int] = None,
+        created_at: Optional[int] = None,
+        subject_user_id: Optional[int] = None,
+        status: str = "active",
+        expires_at: Optional[int] = None,
     ) -> int:
         """Add a long-term fact to SQLite and FTS index."""
         async with self._lock:
-            conn = self._get_connection()
             return await asyncio.to_thread(
-                FTSStore.add_fact, conn, subject, fact, category, source_chat_id
+                self._sync_add_fact,
+                subject,
+                fact,
+                category,
+                source_chat_id,
+                created_at,
+                subject_user_id,
+                status,
+                expires_at,
             )
+
+    def _sync_update_fact(
+        self,
+        fact_id: int,
+        *,
+        fact: Optional[str] = None,
+        subject: Optional[str] = None,
+        subject_user_id: Any = _UNSET,
+        category: Optional[str] = None,
+        expires_at: Any = _UNSET,
+        status: Optional[str] = None,
+        updated_at: Optional[int] = None,
+    ) -> bool:
+        with self._sync_lock:
+            conn = self._get_connection()
+            return FTSStore.update_fact(
+                conn,
+                fact_id,
+                fact=fact,
+                subject=subject,
+                subject_user_id=subject_user_id,
+                category=category,
+                expires_at=expires_at,
+                status=status,
+                updated_at=updated_at,
+            )
+
+    async def update_fact(
+        self,
+        fact_id: int,
+        *,
+        fact: Optional[str] = None,
+        subject: Optional[str] = None,
+        subject_user_id: Any = _UNSET,
+        category: Optional[str] = None,
+        expires_at: Any = _UNSET,
+        status: Optional[str] = None,
+        updated_at: Optional[int] = None,
+    ) -> bool:
+        """Update an existing fact in place and invalidate stale embeddings if text changed."""
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._sync_update_fact,
+                fact_id,
+                fact=fact,
+                subject=subject,
+                subject_user_id=subject_user_id,
+                category=category,
+                expires_at=expires_at,
+                status=status,
+                updated_at=updated_at,
+            )
+
+    def _sync_supersede_fact(
+        self,
+        fact_id: int,
+        *,
+        new_fact_id: Optional[int] = None,
+        status: str = "superseded",
+        updated_at: Optional[int] = None,
+    ) -> bool:
+        with self._sync_lock:
+            conn = self._get_connection()
+            return FTSStore.supersede_fact(
+                conn,
+                fact_id,
+                new_fact_id=new_fact_id,
+                status=status,
+                updated_at=updated_at,
+            )
+
+    async def supersede_fact(
+        self,
+        fact_id: int,
+        *,
+        new_fact_id: Optional[int] = None,
+        status: str = "superseded",
+        updated_at: Optional[int] = None,
+    ) -> bool:
+        """Mark a fact as superseded or archived and remove its embedding."""
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._sync_supersede_fact,
+                fact_id,
+                new_fact_id=new_fact_id,
+                status=status,
+                updated_at=updated_at,
+            )
+
+    def _sync_archive_expired_facts(
+        self,
+        *,
+        now_ts: Optional[int] = None,
+        agreement_ttl_days: Optional[int] = None,
+        event_ttl_days: Optional[int] = None,
+        chat_id: Optional[int] = None,
+    ) -> int:
+        with self._sync_lock:
+            conn = self._get_connection()
+            return FTSStore.archive_expired_facts(
+                conn,
+                now_ts=now_ts,
+                agreement_ttl_days=agreement_ttl_days,
+                event_ttl_days=event_ttl_days,
+                chat_id=chat_id,
+            )
+
+    async def archive_expired_facts(
+        self,
+        *,
+        now_ts: Optional[int] = None,
+        agreement_ttl_days: Optional[int] = None,
+        event_ttl_days: Optional[int] = None,
+        chat_id: Optional[int] = None,
+    ) -> int:
+        """Archive active facts past explicit expires_at or category TTL."""
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._sync_archive_expired_facts,
+                now_ts=now_ts,
+                agreement_ttl_days=agreement_ttl_days,
+                event_ttl_days=event_ttl_days,
+                chat_id=chat_id,
+            )
+
+    def _sync_get_active_facts(
+        self,
+        *,
+        chat_id: Optional[int] = None,
+        subject_user_ids: Optional[Sequence[int]] = None,
+        subjects: Optional[Sequence[str]] = None,
+        categories: Optional[Sequence[str]] = None,
+        include_global: bool = False,
+        limit: int = 50,
+        now_ts: Optional[int] = None,
+    ) -> List[FactRecord]:
+        with self._sync_lock:
+            conn = self._get_connection()
+            return FTSStore.get_active_facts(
+                conn,
+                chat_id=chat_id,
+                subject_user_ids=subject_user_ids,
+                subjects=subjects,
+                categories=categories,
+                include_global=include_global,
+                limit=limit,
+                now_ts=now_ts,
+            )
+
+    async def get_active_facts(
+        self,
+        *,
+        chat_id: Optional[int] = None,
+        subject_user_ids: Optional[Sequence[int]] = None,
+        subjects: Optional[Sequence[str]] = None,
+        categories: Optional[Sequence[str]] = None,
+        include_global: bool = False,
+        limit: int = 50,
+        now_ts: Optional[int] = None,
+    ) -> List[FactRecord]:
+        """Fetch active, non-expired facts filtered by chat scope, subjects, or categories."""
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._sync_get_active_facts,
+                chat_id=chat_id,
+                subject_user_ids=subject_user_ids,
+                subjects=subjects,
+                categories=categories,
+                include_global=include_global,
+                limit=limit,
+                now_ts=now_ts,
+            )
+
+    def _sync_get_facts_by_ids(self, fact_ids: Sequence[int]) -> Dict[int, FactRecord]:
+        with self._sync_lock:
+            conn = self._get_connection()
+            return FTSStore.get_facts_by_ids(conn, fact_ids)
+
+    async def get_facts_by_ids(self, fact_ids: Sequence[int]) -> Dict[int, FactRecord]:
+        """Fetch facts keyed by ID regardless of lifecycle status."""
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_get_facts_by_ids, fact_ids)
+
+    def _sync_upsert_fact_embedding(
+        self,
+        fact_id: int,
+        model: str,
+        dim: int,
+        vector_bytes: bytes,
+        updated_at: Optional[int] = None,
+    ) -> None:
+        with self._sync_lock:
+            conn = self._get_connection()
+            FTSStore.upsert_fact_embedding(conn, fact_id, model, dim, vector_bytes, updated_at)
+
+    async def upsert_fact_embedding(
+        self,
+        fact_id: int,
+        model: str,
+        dim: int,
+        vector_bytes: bytes,
+        updated_at: Optional[int] = None,
+    ) -> None:
+        """Persist or update a float32 embedding vector for an active fact."""
+        async with self._lock:
+            await asyncio.to_thread(
+                self._sync_upsert_fact_embedding,
+                fact_id,
+                model,
+                dim,
+                vector_bytes,
+                updated_at,
+            )
+
+    def _sync_delete_fact_embedding(self, fact_id: int) -> None:
+        with self._sync_lock:
+            conn = self._get_connection()
+            FTSStore.delete_fact_embedding(conn, fact_id)
+
+    async def delete_fact_embedding(self, fact_id: int) -> None:
+        """Delete stored embedding row for fact_id."""
+        async with self._lock:
+            await asyncio.to_thread(self._sync_delete_fact_embedding, fact_id)
+
+    def _sync_get_unembedded_active_facts(
+        self,
+        model: str,
+        limit: int = 32,
+        chat_id: Optional[int] = None,
+        *,
+        now_ts: Optional[int] = None,
+    ) -> List[FactRecord]:
+        with self._sync_lock:
+            conn = self._get_connection()
+            return FTSStore.get_unembedded_active_facts(
+                conn,
+                model,
+                limit,
+                chat_id,
+                now_ts=now_ts,
+            )
+
+    async def get_unembedded_active_facts(
+        self,
+        model: str,
+        limit: int = 32,
+        chat_id: Optional[int] = None,
+        *,
+        now_ts: Optional[int] = None,
+    ) -> List[FactRecord]:
+        """Fetch active non-expired facts lacking an embedding row for `model`."""
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._sync_get_unembedded_active_facts,
+                model,
+                limit,
+                chat_id,
+                now_ts=now_ts,
+            )
+
+    def _sync_delete_fact(self, fact_id: int) -> None:
+        with self._sync_lock:
+            conn = self._get_connection()
+            FTSStore.delete_fact(conn, fact_id)
 
     async def delete_fact(self, fact_id: int) -> None:
         """Delete fact from long-term memory."""
         async with self._lock:
-            conn = self._get_connection()
-            await asyncio.to_thread(FTSStore.delete_fact, conn, fact_id)
+            await asyncio.to_thread(self._sync_delete_fact, fact_id)
 
     def _sync_count_uncompacted(self, chat_id: int) -> int:
         with self._sync_lock:
@@ -502,6 +844,8 @@ class MemoryStore:
                         fact=item.get("fact", ""),
                         category=item.get("category", "lore"),
                         source_chat_id=chat_id,
+                        subject_user_id=item.get("subject_user_id"),
+                        expires_at=item.get("expires_at"),
                     )
                 elif isinstance(item, FactRecord):
                     await self.add_fact(
@@ -509,6 +853,8 @@ class MemoryStore:
                         fact=item.fact,
                         category=item.category,
                         source_chat_id=chat_id,
+                        subject_user_id=item.subject_user_id,
+                        expires_at=item.expires_at,
                     )
 
         msg_ids = [m.id for m in uncompacted if m.id is not None]

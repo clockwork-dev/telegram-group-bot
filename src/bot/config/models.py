@@ -21,12 +21,14 @@ class TelegramConfig(BaseModel):
     ignored_sender_usernames: List[str] = Field(
         default_factory=lambda: ["hermes_kuk7yi6kfm3lcdfa_bot"]
     )
+    ignored_sender_ids: List[int] = Field(default_factory=list)
 
     @field_validator(
         "allowed_chat_ids",
         "allowed_dm_user_ids",
         "admin_user_ids",
         "ignored_sender_usernames",
+        "ignored_sender_ids",
         mode="before",
     )
     @classmethod
@@ -44,6 +46,7 @@ class SpontaneousRepliesConfig(BaseModel):
     probability: float = 0.20
     max_per_hour: int = 3
     active_conversation_window_seconds: int = Field(default=90, ge=0)
+    active_window_probability: Optional[float] = Field(default=None, ge=0.0, le=1.0)
 
 
 class BehaviorConfig(BaseModel):
@@ -176,6 +179,7 @@ class STTConfig(BaseModel):
     timeout_sec: float = Field(default=45.0, gt=0.0)
     allowed_languages: List[str] = Field(default_factory=lambda: ["ru", "uk"])
     model_dir: Optional[str] = "data/models/whisper"
+    idle_unload_seconds: float = Field(default=600.0, ge=0.0)
 
 
 class VoiceConfig(BaseModel):
@@ -213,14 +217,53 @@ class MemoryBackupConfig(BaseModel):
     compress: bool = True
 
 
+class MemoryEmbeddingsConfig(BaseModel):
+    """Gemini semantic embedding settings for hybrid long-term memory recall."""
+
+    enabled: bool = True
+    provider: Literal["gemini"] = "gemini"
+    gemini_model: str = "gemini-embedding-001"
+    gemini_api_key_env: str = "GEMINI_API_KEY"
+    gemini_api_key: Optional[str] = Field(default=None, repr=False)
+    output_dimensionality: int = Field(default=768, ge=64, le=3072)
+    timeout_seconds: float = Field(default=3.0, gt=0.2, le=30.0)
+    min_similarity: float = Field(default=0.52, ge=0.0, le=1.0)
+    query_cache_size: int = Field(default=128, ge=0, le=2048)
+    backfill_batch_size: int = Field(default=20, ge=1, le=100)
+    cooldown_seconds: float = Field(default=120.0, ge=0.0)
+
+    @field_validator("provider", mode="before")
+    @classmethod
+    def _normalize_provider(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip().lower()
+        return value
+
+
+class MemoryReflectionConfig(BaseModel):
+    """Periodic fact consolidation, subject reflection, and TTL archival settings."""
+
+    enabled: bool = True
+    interval_hours: float = Field(default=24.0, gt=0.1)
+    min_active_facts_per_subject: int = Field(default=15, ge=5)
+    max_subjects_per_cycle: int = Field(default=3, ge=1, le=20)
+    target_summary_facts: int = Field(default=4, ge=1, le=10)
+    subject_cooldown_hours: float = Field(default=72.0, ge=0.0)
+    agreement_default_ttl_days: int = Field(default=14, ge=1)
+    event_default_ttl_days: int = Field(default=30, ge=1)
+
+
 class MemoryConfig(BaseModel):
-    """Memory database settings and compaction thresholds."""
+    """Memory database settings, compaction thresholds, hybrid embeddings, and reflection."""
 
     db_path: str = "data/memory.sqlite"
     short_term_limit: int = 30
     compaction_threshold: int = 60
     compaction_batch_size: int = 30
+    compaction_min_substantive: int = Field(default=6, ge=1, le=100)
     backup: MemoryBackupConfig = Field(default_factory=MemoryBackupConfig)
+    embeddings: MemoryEmbeddingsConfig = Field(default_factory=MemoryEmbeddingsConfig)
+    reflection: MemoryReflectionConfig = Field(default_factory=MemoryReflectionConfig)
 
 
 class AntigravityProviderConfig(BaseModel):

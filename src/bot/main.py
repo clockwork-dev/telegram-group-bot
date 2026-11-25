@@ -48,9 +48,16 @@ from bot.media.image_gen import (
 from bot.media.processor import MediaProcessor, ProcessedMedia, _has_media_flag
 from bot.media.stt import STTTranscriber
 from bot.media.tts import TTSSkippedError, TTSSynthesizer, strip_tts_emotion_tags
-from bot.memory.compaction import CompactionEngine
+from bot.memory.compaction import (
+    CompactionEngine,
+    build_compaction_prompt,
+    canonicalize_subject,
+    is_explicit_empty_fact_response,
+)
 from bot.memory.db import ChatMessage, MemoryStore
+from bot.memory.embeddings import MemoryEmbedder, should_run_semantic_lookup
 from bot.memory.fts import FactRecord, extract_archive_terms, extract_fact_terms
+from bot.memory.reflection import ReflectionEngine, build_reflection_prompt
 from bot.proactive.engine import ProactiveEngine
 from bot.quota.manager import QuotaBudgetManager
 from bot.security.sanitizer import SecretSanitizer, install_log_sanitizer
@@ -150,6 +157,8 @@ class GroupBotOrchestrator:
         quota_manager: Optional[QuotaBudgetManager] = None,
         evolution_manager: Optional[Any] = None,
         image_limiter: Optional[ImageGenerationLimiter] = None,
+        memory_embedder: Optional[MemoryEmbedder] = None,
+        reflection_engine: Optional[ReflectionEngine] = None,
     ) -> None:
         self.config_mgr = config_mgr
         bot_cfg = self.config_mgr.bot
@@ -166,8 +175,17 @@ class GroupBotOrchestrator:
         self._owns_stt_transcriber = stt_transcriber is None
         self._owns_tts_synthesizer = tts_synthesizer is None
         self._owns_media_processor = media_processor is None
+        self._owns_memory_embedder = memory_embedder is None
 
         self.memory_store = memory_store or MemoryStore(db_path=bot_cfg.memory.db_path)
+        self.memory_embedder = (
+            memory_embedder
+            if memory_embedder is not None
+            else MemoryEmbedder(bot_cfg.memory.embeddings)
+        )
+        self._default_memory_embedder: Optional[MemoryEmbedder] = (
+            self.memory_embedder if memory_embedder is None else None
+        )
         self.stt_transcriber = (
             stt_transcriber
             if stt_transcriber is not None
@@ -252,6 +270,7 @@ class GroupBotOrchestrator:
                     allowed_chat_ids=bot_cfg.telegram.allowed_chat_ids,
                     allowed_dm_user_ids=effective_dm_ids,
                     ignored_sender_usernames=bot_cfg.telegram.ignored_sender_usernames,
+                    ignored_sender_ids=bot_cfg.telegram.ignored_sender_ids,
                     bot_names=bot_cfg.behavior.bot_names,
                     typing_cpm=bot_cfg.behavior.typing_speed_cpm,
                     typing_min_seconds=bot_cfg.behavior.typing_min_seconds,
@@ -267,6 +286,7 @@ class GroupBotOrchestrator:
                     allowed_chat_ids=bot_cfg.telegram.allowed_chat_ids,
                     allowed_dm_user_ids=effective_dm_ids,
                     ignored_sender_usernames=bot_cfg.telegram.ignored_sender_usernames,
+                    ignored_sender_ids=bot_cfg.telegram.ignored_sender_ids,
                     bot_names=bot_cfg.behavior.bot_names,
                     typing_cpm=bot_cfg.behavior.typing_speed_cpm,
                     typing_min_seconds=bot_cfg.behavior.typing_min_seconds,
@@ -277,14 +297,52 @@ class GroupBotOrchestrator:
         self.config_mgr.register_reload_callback(self._on_config_reloaded)
 
         bot_uid = getattr(self.userbot, "bot_id", None)
-        excluded_uids = [int(bot_uid)] if bot_uid else None
+        excluded_uids_set = {int(uid) for uid in (bot_cfg.telegram.ignored_sender_ids or [])}
+        if bot_uid:
+            excluded_uids_set.add(int(bot_uid))
+        excluded_uids = sorted(excluded_uids_set) if excluded_uids_set else None
+        refl_cfg = bot_cfg.memory.reflection
+        engine_embedder = (
+            self.memory_embedder
+            if (
+                memory_embedder is not None
+                or isinstance(self.provider, (AntigravityProvider, AntigravityCLIClient))
+            )
+            else None
+        )
         self.compaction_engine = CompactionEngine(
             memory_store=self.memory_store,
             summarize_fn=self._summarize_transcript_via_provider,
             threshold=bot_cfg.memory.compaction_threshold,
             batch_size=bot_cfg.memory.compaction_batch_size,
             excluded_user_ids=excluded_uids,
+            min_substantive_messages=bot_cfg.memory.compaction_min_substantive,
+            friends_provider=self._get_friends_map,
+            bot_names=list(bot_cfg.behavior.bot_names or []),
+            embedder=engine_embedder,
+            agreement_ttl_days=refl_cfg.agreement_default_ttl_days,
+            event_ttl_days=refl_cfg.event_default_ttl_days,
+            bot_id=int(bot_uid) if bot_uid else None,
         )
+        self.reflection_engine = (
+            reflection_engine
+            if reflection_engine is not None
+            else ReflectionEngine(
+                memory_store=self.memory_store,
+                reflect_fn=self._reflect_subject_via_provider,
+                min_active_facts_per_subject=refl_cfg.min_active_facts_per_subject,
+                max_subjects_per_cycle=refl_cfg.max_subjects_per_cycle,
+                target_summary_facts=refl_cfg.target_summary_facts,
+                subject_cooldown_hours=refl_cfg.subject_cooldown_hours,
+                agreement_default_ttl_days=refl_cfg.agreement_default_ttl_days,
+                event_default_ttl_days=refl_cfg.event_default_ttl_days,
+                embedder=engine_embedder,
+                friends_provider=self._get_friends_map,
+                bot_id=int(bot_uid) if bot_uid else None,
+                bot_names=list(bot_cfg.behavior.bot_names or []),
+            )
+        )
+        self._reflection_task: Optional[asyncio.Task[Any]] = None
         self.userbot.register_message_handler(self._on_incoming_message)
 
         self._debounce_buffers: Dict[int, List[IncomingMessage]] = {}
@@ -335,30 +393,97 @@ class GroupBotOrchestrator:
         tts_cfg = bot_cfg.voice.tts
         if tts_cfg.gemini_api_key:
             self.sanitizer.register_secret(tts_cfg.gemini_api_key)
-        for env_name in (tts_cfg.gemini_api_key_env, "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        emb_cfg = getattr(bot_cfg.memory, "embeddings", None)
+        if emb_cfg is not None and emb_cfg.gemini_api_key:
+            self.sanitizer.register_secret(emb_cfg.gemini_api_key)
+        for env_name in (
+            tts_cfg.gemini_api_key_env,
+            getattr(emb_cfg, "gemini_api_key_env", None),
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+        ):
             if env_name:
                 env_val = os.environ.get(env_name)
                 if env_val:
                     self.sanitizer.register_secret(env_val)
 
+    def _get_friends_map(self) -> Dict[int, FriendProfile]:
+        """Return active friends map from ConfigManager safely."""
+        friends_cfg = getattr(self.config_mgr, "friends", None)
+        return dict(getattr(friends_cfg, "friends", None) or {})
+
+    def _is_embedder_active(self) -> bool:
+        """Return True when semantic embeddings are available and not running against an unmocked offline test provider."""
+        embedder = getattr(self, "memory_embedder", None)
+        if embedder is None or not embedder.is_available():
+            return False
+        if not getattr(self, "_owns_memory_embedder", True):
+            return True
+        if embedder is not getattr(self, "_default_memory_embedder", None):
+            return True
+        if getattr(embedder, "_injected_client", None) is not None:
+            return True
+        return isinstance(self.provider, (AntigravityProvider, AntigravityCLIClient))
+
+    def _sync_bot_identity_to_memory_engines(self) -> None:
+        """Propagate resolved Telegram bot_id and ignored_sender_ids into compaction and reflection engines."""
+        bot_uid = getattr(self.userbot, "bot_id", None)
+        if bot_uid:
+            uid_int = int(bot_uid)
+            self.compaction_engine.bot_id = uid_int
+            self.compaction_engine.excluded_user_ids.add(uid_int)
+            self.reflection_engine.bot_id = uid_int
+        bot_cfg = self.config_mgr.bot
+        if bot_cfg is not None:
+            for ign_uid in getattr(bot_cfg.telegram, "ignored_sender_ids", []) or []:
+                self.compaction_engine.excluded_user_ids.add(int(ign_uid))
+
     def _on_config_reloaded(self) -> None:
-        """Synchronize Telegram access lists, voice settings, image limiter, and secret sanitizer on reload."""
+        """Synchronize Telegram access lists, voice/memory settings, image limiter, and secret sanitizer on reload."""
         bot_cfg = self.config_mgr.bot
         if bot_cfg is None:
             return
         self._register_config_secrets(bot_cfg)
         self._sync_voice_configs(bot_cfg)
         self._image_limiter.update_config(bot_cfg.image_generation)
+        if hasattr(self, "memory_embedder") and self.memory_embedder is not None:
+            self.memory_embedder.update_config(bot_cfg.memory.embeddings)
+        if hasattr(self, "compaction_engine") and self.compaction_engine is not None:
+            self.compaction_engine.threshold = bot_cfg.memory.compaction_threshold
+            self.compaction_engine.batch_size = bot_cfg.memory.compaction_batch_size
+            self.compaction_engine.min_substantive_messages = (
+                bot_cfg.memory.compaction_min_substantive
+            )
+            self.compaction_engine.bot_names = list(bot_cfg.behavior.bot_names or [])
+            self.compaction_engine.agreement_ttl_days = (
+                bot_cfg.memory.reflection.agreement_default_ttl_days
+            )
+            self.compaction_engine.event_ttl_days = (
+                bot_cfg.memory.reflection.event_default_ttl_days
+            )
+        if hasattr(self, "reflection_engine") and self.reflection_engine is not None:
+            self.reflection_engine.update_config(bot_cfg.memory.reflection)
+            self.reflection_engine.bot_names = list(bot_cfg.behavior.bot_names or [])
+        self._sync_bot_identity_to_memory_engines()
         resolved_token = resolve_bot_token_from_env_or_config(bot_cfg.telegram.bot_token)
         if resolved_token:
             self.sanitizer.register_secret(resolved_token)
         if hasattr(self.userbot, "sync_access_lists"):
-            self.userbot.sync_access_lists(
-                allowed_chat_ids=bot_cfg.telegram.allowed_chat_ids,
-                allowed_dm_user_ids=self._effective_dm_user_ids(bot_cfg),
-                ignored_sender_usernames=bot_cfg.telegram.ignored_sender_usernames,
-                bot_names=bot_cfg.behavior.bot_names,
-            )
+            sync_kwargs: Dict[str, Any] = {
+                "allowed_chat_ids": bot_cfg.telegram.allowed_chat_ids,
+                "allowed_dm_user_ids": self._effective_dm_user_ids(bot_cfg),
+                "ignored_sender_usernames": bot_cfg.telegram.ignored_sender_usernames,
+                "bot_names": bot_cfg.behavior.bot_names,
+            }
+            try:
+                sig = inspect.signature(self.userbot.sync_access_lists)
+                if "ignored_sender_ids" in sig.parameters or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                ):
+                    sync_kwargs["ignored_sender_ids"] = bot_cfg.telegram.ignored_sender_ids
+            except (TypeError, ValueError):
+                pass
+            self.userbot.sync_access_lists(**sync_kwargs)
 
     async def send_sanitized_message(
         self,
@@ -521,22 +646,22 @@ class GroupBotOrchestrator:
                     for lang in stt_cfg.allowed_languages
                     if str(lang).strip()
                 )
+                self.stt_transcriber.idle_unload_seconds = max(
+                    0.0, float(getattr(stt_cfg, "idle_unload_seconds", 600.0) or 0.0)
+                )
                 self.stt_transcriber.ffmpeg_path = bot_cfg.media.ffmpeg_path
 
-    async def _summarize_transcript_via_provider(self, transcript: str) -> List[Dict[str, str]]:
-        """Extract genuinely durable facts from human conversation transcript using Antigravity."""
+    async def _summarize_transcript_via_provider(
+        self,
+        transcript: str,
+        existing_facts: Optional[Sequence[FactRecord]] = None,
+        chat_id: Optional[int] = None,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Extract genuinely durable upsert fact operations from human conversation transcript using Antigravity."""
         if self._is_provider_rate_limited(role="compaction"):
             logger.info("Skipping compaction summarization while provider is rate-limited.")
-            return []
-        prompt = (
-            "Проанализируй фрагмент переписки участников чата и выдели ТОЛЬКО 1-2 по-настоящему "
-            "долгосрочных новых факта (важные договорённости, реальные события, устойчивые интересы "
-            "или изменения в жизни участников). Игнорируй односложную болтовню, шутки, смех, приветствия "
-            "и старые мемы. Если ничего по-настоящему долгосрочного нет — верни пустой массив [].\n"
-            "Формат строго JSON-массив: "
-            '[{"subject": "...", "fact": "...", "category": "lore|event|agreement|friend_bio"}].\n\n'
-            f"Переписка:\n{transcript}"
-        )
+            return None
+        prompt = build_compaction_prompt(transcript, existing_facts=existing_facts)
         chosen_model: Optional[str] = None
         chosen_effort: Optional[str] = None
         qm = getattr(self, "quota_manager", None)
@@ -581,10 +706,86 @@ class GroupBotOrchestrator:
                 except Exception as rec_exc:
                     logger.debug("Failed to record compaction usage: %s", rec_exc)
             text = resp.text if hasattr(resp, "text") else str(resp)
-            return self.compaction_engine._parse_extracted_facts(text)
+            if is_explicit_empty_fact_response(text):
+                return []
+            parsed = self.compaction_engine._parse_extracted_facts(text)
+            return parsed if parsed else None
         except Exception as exc:
-            logger.debug("Compaction summarization fallback triggered: %s", exc)
-            return []
+            logger.debug(
+                "Compaction summarization fallback triggered (chat=%s): %s",
+                chat_id,
+                exc,
+            )
+            return None
+
+    async def _reflect_subject_via_provider(
+        self,
+        *,
+        subject: str,
+        facts: Sequence[FactRecord],
+        chat_id: Optional[int] = None,
+        target_summary_facts: int = 4,
+    ) -> str:
+        """Consolidate accumulated subject micro-facts via Antigravity under strict chat profile."""
+        if self._is_provider_rate_limited(role="compaction"):
+            logger.info("Skipping memory reflection while provider is rate-limited.")
+            return ""
+        prompt = build_reflection_prompt(
+            subject=subject,
+            facts=facts,
+            target_summary_facts=target_summary_facts,
+        )
+        chosen_model: Optional[str] = None
+        chosen_effort: Optional[str] = None
+        qm = getattr(self, "quota_manager", None)
+        if qm is not None and hasattr(qm, "select_model"):
+            try:
+                chosen_model, chosen_effort = qm.select_model("compaction")
+            except Exception:
+                chosen_model, chosen_effort = None, None
+        try:
+            try:
+                if chosen_model is not None:
+                    resp = await self.provider.generate_response(
+                        prompt=prompt,
+                        model=chosen_model,
+                        effort=chosen_effort,
+                        tool_profile="chat",
+                    )
+                else:
+                    resp = await self.provider.generate_response(
+                        prompt=prompt,
+                        tool_profile="chat",
+                    )
+            except TypeError:
+                try:
+                    resp = await self.provider.generate_response(
+                        prompt=prompt,
+                        tool_profile="chat",
+                    )
+                except TypeError:
+                    resp = await self.provider.generate_response(prompt=prompt)
+            usage = getattr(resp, "usage", None)
+            if usage is not None and qm is not None and hasattr(qm, "record_usage"):
+                try:
+                    model_name = getattr(resp, "model", None) or chosen_model or "unknown"
+                    rec = qm.record_usage(
+                        usage,
+                        model=model_name,
+                        source="compaction",
+                    )
+                    if inspect.isawaitable(rec):
+                        await rec
+                except Exception as rec_exc:
+                    logger.debug("Failed to record reflection usage: %s", rec_exc)
+            return resp.text if hasattr(resp, "text") else str(resp)
+        except Exception as exc:
+            logger.debug(
+                "Memory reflection generation failed (chat=%s): %s",
+                chat_id,
+                type(exc).__name__,
+            )
+            return ""
 
     @staticmethod
     def summarize_processed_media(processed: Optional[ProcessedMedia]) -> Optional[str]:
@@ -1178,6 +1379,8 @@ class GroupBotOrchestrator:
         """Evaluate ReplyHeuristics across a single message or coalesced burst before media download."""
         spont_cfg = bot_cfg.behavior.spontaneous_replies
         active_cooldown = getattr(spont_cfg, "active_window_cooldown_seconds", None)
+        active_prob = getattr(spont_cfg, "active_window_probability", None)
+        ignored_ids = getattr(bot_cfg.telegram, "ignored_sender_ids", None)
 
         # 1. Check direct mention / reply-to-bot across all messages in the batch first
         effective_dm_ids = self._effective_dm_user_ids(bot_cfg)
@@ -1190,6 +1393,7 @@ class GroupBotOrchestrator:
                 allowed_chat_ids=bot_cfg.telegram.allowed_chat_ids,
                 allowed_dm_user_ids=effective_dm_ids,
                 ignored_sender_usernames=bot_cfg.telegram.ignored_sender_usernames,
+                ignored_sender_ids=ignored_ids,
                 spontaneous_enabled=False,
                 in_quiet_hours=in_quiet,
                 time_since_last_bot_msg=time_since_bot,
@@ -1199,6 +1403,7 @@ class GroupBotOrchestrator:
                 active_conversation_window_seconds=float(spont_cfg.active_conversation_window_seconds),
                 max_per_hour=spont_cfg.max_per_hour,
                 active_window_cooldown_seconds=active_cooldown,
+                active_window_probability=active_prob,
                 now=now,
             )
             if res == ReplyAction.MUST_REPLY:
@@ -1246,6 +1451,7 @@ class GroupBotOrchestrator:
             allowed_chat_ids=bot_cfg.telegram.allowed_chat_ids,
             allowed_dm_user_ids=effective_dm_ids,
             ignored_sender_usernames=bot_cfg.telegram.ignored_sender_usernames,
+            ignored_sender_ids=ignored_ids,
             spontaneous_enabled=spont_cfg.enabled,
             in_quiet_hours=in_quiet,
             time_since_last_bot_msg=time_since_bot,
@@ -1255,6 +1461,7 @@ class GroupBotOrchestrator:
             active_conversation_window_seconds=float(spont_cfg.active_conversation_window_seconds),
             max_per_hour=spont_cfg.max_per_hour,
             active_window_cooldown_seconds=active_cooldown,
+            active_window_probability=active_prob,
             now=now,
         )
         return decision, primary
@@ -1324,6 +1531,7 @@ class GroupBotOrchestrator:
         allowed_dm_ints = {int(uid) for uid in allowed_dms} if allowed_dms else set()
 
         bot_id = getattr(self.userbot, "bot_id", None)
+        ignored_ids = {int(uid) for uid in (getattr(bot_cfg.telegram, "ignored_sender_ids", []) or [])}
         ignored_usernames = {"hermes_kuk7yi6kfm3lcdfa_bot"}
         if bot_cfg.telegram.ignored_sender_usernames:
             ignored_usernames.update(
@@ -1336,6 +1544,8 @@ class GroupBotOrchestrator:
                 continue
             sender_id = getattr(raw, "sender_id", m.sender_id)
             if bot_id is not None and sender_id == bot_id:
+                continue
+            if sender_id is not None and int(sender_id) in ignored_ids:
                 continue
 
             # Anti-loop check on sender
@@ -1670,8 +1880,12 @@ class GroupBotOrchestrator:
         async with comp_lock:
             if self._is_provider_rate_limited(role="compaction"):
                 return
+            self._sync_bot_identity_to_memory_engines()
             bot_uid = getattr(self.userbot, "bot_id", None)
-            excluded_uids = [int(bot_uid)] if bot_uid else None
+            excl_set = {int(uid) for uid in (getattr(self.config_mgr.bot.telegram, "ignored_sender_ids", []) or [])} if self.config_mgr.bot else set()
+            if bot_uid:
+                excl_set.add(int(bot_uid))
+            excluded_uids = sorted(excl_set) if excl_set else None
             await self.compaction_engine.run_compaction_for_chat(
                 chat_id,
                 excluded_user_ids=excluded_uids,
@@ -2172,7 +2386,7 @@ class GroupBotOrchestrator:
             cmd_name = cmd_part.lower()
             norm_target = target_bot.strip().lstrip("@").lower()
             norm_self = (bot_username or "").strip().lstrip("@").lower()
-            if norm_target and norm_self and norm_target != norm_self:
+            if norm_target and (not norm_self or norm_target != norm_self):
                 return (cmd_name, arg, True)
         else:
             cmd_name = head.lower()
@@ -2540,6 +2754,46 @@ class GroupBotOrchestrator:
 
         return ("chat", None, None)
 
+    def _resolve_reply_target_user_ids(
+        self,
+        primary: IncomingMessage,
+        messages: Sequence[IncomingMessage],
+        bot_cfg: BotConfig,
+    ) -> Optional[List[int]]:
+        """Resolve unambiguous reply target user IDs from IncomingMessage metadata or friends directory."""
+        bot_uid = getattr(self.userbot, "bot_id", None)
+        bot_uid_int = int(bot_uid) if bot_uid else None
+        resolved: List[int] = []
+        seen: Set[int] = set()
+
+        for msg in (primary, *messages):
+            raw = getattr(msg, "raw_event", None)
+            for attr in ("reply_to_user_id", "reply_to_sender_id"):
+                candidate = getattr(msg, attr, None)
+                if candidate is None and raw is not None:
+                    candidate = getattr(raw, attr, None)
+                if isinstance(candidate, int) and not isinstance(candidate, bool):
+                    if candidate > 0 and candidate != bot_uid_int and candidate not in seen:
+                        seen.add(candidate)
+                        resolved.append(candidate)
+
+        if not resolved:
+            raw_primary = getattr(primary, "raw_event", None)
+            reply_author = getattr(primary, "reply_to_author", None) or (
+                getattr(raw_primary, "reply_to_author", None) if raw_primary is not None else None
+            )
+            if isinstance(reply_author, str) and reply_author.strip():
+                _, matched_uid = canonicalize_subject(
+                    reply_author,
+                    friends_map=self._get_friends_map(),
+                    bot_id=bot_uid_int,
+                    bot_names=bot_cfg.behavior.bot_names,
+                )
+                if matched_uid is not None and matched_uid != bot_uid_int:
+                    resolved.append(int(matched_uid))
+
+        return resolved or None
+
     async def _complete_reply_turn(
         self,
         *,
@@ -2588,22 +2842,42 @@ class GroupBotOrchestrator:
 
         friend = self.config_mgr.get_friend_profile(primary.sender_id)
 
-        # 2. Selective FTS5 memory fact lookup (text ONLY, never author_display)
+        # 2. Selective chat-scoped hybrid FTS5 + semantic vector memory fact lookup
         facts: List[FactRecord] = []
         meaningful_terms = extract_fact_terms(combined_text)
-        if len(combined_text) >= 12 and len(meaningful_terms) >= 2:
+        embedder = getattr(self, "memory_embedder", None)
+        wants_semantic = bool(
+            self._is_embedder_active() and should_run_semantic_lookup(combined_text)
+        )
+        if (len(combined_text) >= 12 and len(meaningful_terms) >= 2) or wants_semantic:
             excluded_fact_ids = self._get_recent_fact_ids(chat_id, now=now)
-            if excluded_fact_ids:
-                try:
-                    facts = await self.memory_store.search_facts(
-                        combined_text,
-                        limit=3,
-                        exclude_fact_ids=excluded_fact_ids,
-                    )
-                except TypeError:
+            query_vec = await embedder.embed_query(combined_text) if wants_semantic and embedder is not None else None
+            target_uids = self._resolve_reply_target_user_ids(primary, messages, bot_cfg)
+            emb_cfg = bot_cfg.memory.embeddings
+            try:
+                facts = await self.memory_store.search_facts(
+                    combined_text,
+                    limit=3,
+                    exclude_fact_ids=excluded_fact_ids or None,
+                    chat_id=chat_id,
+                    author_user_id=primary.sender_id,
+                    target_user_ids=target_uids,
+                    query_vector=query_vec,
+                    embedding_model=emb_cfg.gemini_model,
+                    min_vector_similarity=emb_cfg.min_similarity,
+                )
+            except TypeError:
+                if excluded_fact_ids:
+                    try:
+                        facts = await self.memory_store.search_facts(
+                            combined_text,
+                            limit=3,
+                            exclude_fact_ids=excluded_fact_ids,
+                        )
+                    except TypeError:
+                        facts = await self.memory_store.search_facts(combined_text, limit=3)
+                else:
                     facts = await self.memory_store.search_facts(combined_text, limit=3)
-            else:
-                facts = await self.memory_store.search_facts(combined_text, limit=3)
 
         history_limit = min(int(bot_cfg.memory.short_term_limit), 10)
         recent_history = await self.memory_store.get_recent_history(
@@ -2618,9 +2892,10 @@ class GroupBotOrchestrator:
         )
 
         exclude_ids = {m.id for m in recent_history if m.id is not None}
-        exclude_users = (
-            {int(self.userbot.bot_id)} if self.userbot and self.userbot.bot_id else None
-        )
+        excl_user_set = {int(uid) for uid in (getattr(bot_cfg.telegram, "ignored_sender_ids", []) or [])}
+        if self.userbot and self.userbot.bot_id:
+            excl_user_set.add(int(self.userbot.bot_id))
+        exclude_users = excl_user_set or None
         archive_hits: List[ChatMessage] = []
         if hasattr(self.memory_store, "search_messages") and self._should_search_archive(
             combined_text
@@ -3135,6 +3410,7 @@ class GroupBotOrchestrator:
         await self.quota_manager.sync_from_db()
         await self.config_mgr.start_watcher()
         await self.userbot.start()
+        self._sync_bot_identity_to_memory_engines()
         self.evolution_manager.userbot = self.userbot
         await self.evolution_manager.reconcile_pending_deploy()
         await self._seed_chat_states_from_memory()
@@ -3148,6 +3424,10 @@ class GroupBotOrchestrator:
         self._backup_task = asyncio.create_task(
             self._memory_backup_loop(),
             name="memory-backup-loop",
+        )
+        self._reflection_task = asyncio.create_task(
+            self._run_reflection_loop(),
+            name="memory-reflection",
         )
 
     async def _run_memory_backup_once(self) -> Optional[Any]:
@@ -3199,8 +3479,67 @@ class GroupBotOrchestrator:
                 logger.warning("Scheduled memory backup failed: %s", exc)
                 await asyncio.sleep(3600.0)
 
+    async def _run_reflection_loop(self) -> None:
+        """Periodically backfill missing fact embeddings, archive expired facts, and reflect dense subjects."""
+        try:
+            await asyncio.sleep(45.0)
+        except asyncio.CancelledError:
+            return
+
+        while True:
+            try:
+                bot_cfg = self.config_mgr.bot
+                self._sync_bot_identity_to_memory_engines()
+
+                if (
+                    bot_cfg is not None
+                    and bot_cfg.memory.embeddings.enabled
+                    and self.memory_embedder is not None
+                    and self._is_embedder_active()
+                ):
+                    indexed = await self.memory_embedder.backfill_missing(self.memory_store)
+                    if indexed > 0:
+                        logger.info("Backfilled %d missing memory fact embeddings.", indexed)
+
+                refl_cfg = bot_cfg.memory.reflection if bot_cfg is not None else None
+                if refl_cfg is not None and refl_cfg.enabled and self.reflection_engine is not None:
+                    stats = await self.reflection_engine.run_cycle(
+                        is_rate_limited_fn=lambda: self._is_provider_rate_limited(
+                            role="compaction"
+                        ),
+                    )
+                    if any(stats.values()):
+                        logger.info("Memory reflection cycle completed: %s", stats)
+
+                sleep_sec = (
+                    max(300.0, float(refl_cfg.interval_hours) * 3600.0)
+                    if refl_cfg is not None
+                    else 86400.0
+                )
+                await asyncio.sleep(sleep_sec)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning(
+                    "Memory reflection loop failed: %s",
+                    self.sanitizer.sanitize(exc),
+                )
+                try:
+                    await asyncio.sleep(3600.0)
+                except asyncio.CancelledError:
+                    break
+
     async def stop(self) -> None:
         """Gracefully stop all background tasks and close connections."""
+        reflection_task = getattr(self, "_reflection_task", None)
+        if reflection_task is not None and not reflection_task.done():
+            reflection_task.cancel()
+            try:
+                await reflection_task
+            except asyncio.CancelledError:
+                pass
+        self._reflection_task = None
+
         backup_task = getattr(self, "_backup_task", None)
         if backup_task is not None and not backup_task.done():
             backup_task.cancel()
@@ -3234,6 +3573,10 @@ class GroupBotOrchestrator:
         await self.userbot.stop()
         if self._owns_stt_transcriber and hasattr(self.stt_transcriber, "close"):
             self.stt_transcriber.close()
+        if getattr(self, "_owns_memory_embedder", False) and hasattr(
+            getattr(self, "memory_embedder", None), "_close_owned_client"
+        ):
+            self.memory_embedder._close_owned_client()
         if hasattr(self.provider, "close"):
             self.provider.close()
         await self.memory_store.close()

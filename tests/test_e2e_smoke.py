@@ -932,6 +932,14 @@ async def test_orchestrator_skip_fact_cooldown_and_gated_prompts(tmp_path: Path)
         config_mgr.bot.telegram.allowed_chat_ids.append(-1003845062562)
     if "піструнькиня" not in config_mgr.bot.behavior.bot_names:
         config_mgr.bot.behavior.bot_names.append("піструнькиня")
+    if not config_mgr.friends.friends:
+        from bot.config.models import FriendProfile
+
+        config_mgr.friends.friends[111222333] = FriendProfile(
+            name="Алексей",
+            aliases=["Лёша"],
+            bio="Любит собирать кастомные клавиатуры",
+        )
     memory_store = MemoryStore(db_path=str(tmp_path / "test_facts_skip.sqlite"))
     await memory_store.init_db()
     media_proc = MediaProcessor(max_doc_size_mb=10, temp_dir_base=str(tmp_path / "tmp_media"))

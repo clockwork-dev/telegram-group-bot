@@ -10,6 +10,7 @@ telegram:
   admin_user_ids: []
   ignored_sender_usernames:
     - "hermes_kuk7yi6kfm3lcdfa_bot"
+  ignored_sender_ids: []
 
 behavior:
   bot_names:
@@ -24,9 +25,10 @@ behavior:
   spontaneous_replies:
     enabled: true
     min_interval_seconds: 300
-    probability: 0.20
-    max_per_hour: 3
-    active_conversation_window_seconds: 90
+    probability: 0.08
+    max_per_hour: 2
+    active_conversation_window_seconds: 45
+    active_window_probability: 0.22
 
 quiet_hours:
   enabled: true
@@ -81,14 +83,35 @@ media:
 memory:
   db_path: "data/memory.sqlite"
   short_term_limit: 30
-  compaction_threshold: 60
-  compaction_batch_size: 30
+  compaction_threshold: 220
+  compaction_batch_size: 140
+  compaction_min_substantive: 12
   backup:
     enabled: true
     backup_dir: "data/backups"
     interval_hours: 24.0
     retain_count: 14
     compress: true
+  embeddings:
+    enabled: true
+    provider: "gemini" # Semantic vector recall via Gemini embeddings (hybrid FTS5 + RRF)
+    gemini_model: "gemini-embedding-001"
+    gemini_api_key_env: "GEMINI_API_KEY" # Reads API key from environment / .env (never commit raw keys)
+    output_dimensionality: 768
+    timeout_seconds: 3.0
+    min_similarity: 0.52
+    query_cache_size: 128
+    backfill_batch_size: 20
+    cooldown_seconds: 120.0
+  reflection:
+    enabled: true # Periodic consolidation of redundant per-subject facts and TTL archival
+    interval_hours: 24.0
+    min_active_facts_per_subject: 15
+    max_subjects_per_cycle: 3
+    target_summary_facts: 4
+    subject_cooldown_hours: 72.0
+    agreement_default_ttl_days: 14
+    event_default_ttl_days: 30
 
 voice:
   tts:

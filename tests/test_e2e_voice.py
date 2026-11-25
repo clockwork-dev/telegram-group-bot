@@ -1000,15 +1000,18 @@ async def test_build_context_prompt_voice_reply_mode_and_system_prompt_conversat
             "warm and excited",
         )
 
-        for target_text in (prompt_voice, sys_prompt):
-            assert "ГОЛОСОВОЙ ОТВЕТ" in target_text
-            for mood in expected_moods:
-                assert mood in target_text
-            for tag in expected_tags:
-                assert tag in target_text
-            for phrase in expected_phrases:
-                assert phrase in target_text
-            for cue in old_cues:
-                assert cue not in target_text
+        for mood in expected_moods:
+            assert mood in prompt_voice
+        for tag in expected_tags:
+            assert tag in prompt_voice
+        for phrase in expected_phrases:
+            assert phrase in prompt_voice
+        for cue in old_cues:
+            assert cue not in prompt_voice
+            assert cue not in sys_prompt
+        # Static system_prompt stays lean on text turns while pointing to ГОЛОСОВОЙ ОТВЕТ
+        assert "ГОЛОСОВОЙ ОТВЕТ" in sys_prompt
+        assert "[MOOD:" in sys_prompt
+        assert "Потужнич" in sys_prompt
     finally:
         await orchestrator.stop()
